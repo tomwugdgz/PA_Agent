@@ -17,6 +17,7 @@ from PyQt6.QtCore import QThread, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDialog,
     QDoubleSpinBox,
     QHBoxLayout,
@@ -111,18 +112,57 @@ class MT5PanelDialog(QDialog):
         self._status.setWordWrap(True)
         root.addWidget(self._status)
 
-    # ── Tab 1：下单 ───────────────────────────────────────────────────────────
+    # ── Tab 1：下单（参数可编辑，默认按当前 AI 分析填入） ─────────────────────
 
     def _build_trade_tab(self) -> QWidget:
         w = QWidget()
         v = QVBoxLayout(w)
 
         self._decision_text = QTextBrowser()
-        self._decision_text.setMaximumHeight(200)
+        self._decision_text.setMaximumHeight(140)
         v.addWidget(self._decision_text)
         self._show_decision()
 
-        row = QHBoxLayout()
+        # ── 可编辑下单参数：AI 分析填默认值，用户可自行修改 ─────────────
+        row1 = QHBoxLayout()
+        self._cb_dir = QComboBox(); self._cb_dir.addItems(["多头", "空头"])
+        self._cb_kind = QComboBox(); self._cb_kind.addItems(["市价单", "限价单", "突破单"])
+        for label, widget in (("方向", self._cb_dir), ("类型", self._cb_kind)):
+            box = QWidget(); hb = QHBoxLayout(box); hb.setContentsMargins(0, 0, 0, 0)
+            hb.addWidget(QLabel(label)); hb.addWidget(widget)
+            row1.addWidget(box)
+        row1.addStretch()
+        v.addLayout(row1)
+
+        row2 = QHBoxLayout()
+
+        def _price_spin() -> QDoubleSpinBox:
+            sp = QDoubleSpinBox()
+            sp.setRange(0.0, 1e9); sp.setDecimals(5); sp.setSingleStep(0.0001)
+            return sp
+
+        self._t_entry = _price_spin()
+        self._t_stop = _price_spin()
+        self._t_tp = _price_spin()
+        self._t_lot = QDoubleSpinBox()
+        self._t_lot.setRange(0.01, 1000.0); self._t_lot.setDecimals(2)
+        self._t_lot.setSingleStep(0.01)
+        self._t_lot.setValue(float(getattr(self._cfg, "default_lot", 0.01) or 0.01))
+        for label, sp in (("入场", self._t_entry), ("止损", self._t_stop),
+                          ("止盈", self._t_tp), ("手数", self._t_lot)):
+            box = QWidget(); hb = QHBoxLayout(box); hb.setContentsMargins(0, 0, 0, 0)
+            hb.addWidget(QLabel(label)); hb.addWidget(sp)
+            row2.addWidget(box)
+        v.addLayout(row2)
+
+        hint = QLabel("市价单不需要入场价（留 0 即可）；限价单/突破单必须填入场价；止损必填。")
+        hint.setObjectName("mutedLabel")
+        hint.setWordWrap(True)
+        v.addWidget(hint)
+
+        row3 = QHBoxLayout()
+        self._fill_btn = QPushButton("按当前分析填入")
+        self._fill_btn.clicked.connect(self._fill_from_decision)
         self._connect_btn = QPushButton("连接 MT5")
         self._connect_btn.clicked.connect(self._on_connect)
         self._send_btn = QPushButton("确认后向 MT5 下单")
@@ -132,10 +172,10 @@ class MT5PanelDialog(QDialog):
             self._send_btn.setToolTip(
                 "已禁用：config/settings.json → mt5trading.enabled 设为 true 后可用"
             )
-        row.addWidget(self._connect_btn)
-        row.addWidget(self._send_btn)
-        row.addStretch()
-        v.addLayout(row)
+        for b in (self._fill_btn, self._connect_btn, self._send_btn):
+            row3.addWidget(b)
+        row3.addStretch()
+        v.addLayout(row3)
         v.addStretch()
         return w
 
@@ -147,27 +187,49 @@ class MT5PanelDialog(QDialog):
         d = self._decision()
         if not d:
             self._decision_text.setHtml(
-                "<p>当前没有 AI 分析决策。请先在主窗口「提交分析」成功后再来下单。</p>"
+                "<p>当前没有 AI 分析决策。可手动设置下方参数直接下单，"
+                "或先在主窗口「提交分析」。</p>"
             )
             return
         if str(d.get("order_type") or "") not in ("限价单", "突破单", "市价单"):
             self._decision_text.setHtml(
-                "<p>最近一次 AI 分析未给出可执行订单（no_order），无法下单。</p>"
+                "<p>最近一次 AI 分析未给出可执行订单（no_order）。"
+                "可手动设置下方参数直接下单。</p>"
             )
             return
         rows = [
             ("方向", d.get("order_direction")), ("订单类型", d.get("order_type")),
             ("入场", d.get("entry_price")), ("止损", d.get("stop_loss_price")),
             ("止盈 TP1", d.get("take_profit_price")),
-            ("止盈 TP2（记录用）", d.get("take_profit_price_2")),
             ("置信度", d.get("trade_confidence")),
             ("入场依据", d.get("entry_rule")),
-            ("失效条件", d.get("invalidation_condition")),
         ]
         html = "".join(
             f"<p><b>{k}</b>：{'' if v is None else v}</p>" for k, v in rows
         )
         self._decision_text.setHtml(html)
+
+    def _fill_from_decision(self) -> None:
+        """把当前 AI 决策填进下单参数（方向/类型/入场/止损/止盈），手数不动。"""
+        d = self._decision()
+        if not d or str(d.get("order_type") or "") not in ("限价单", "突破单", "市价单"):
+            QMessageBox.information(
+                self, "按分析填入", "当前没有可执行的 AI 决策（no_order），请手动设置参数。")
+            return
+
+        def _f(v: Any) -> float:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return 0.0
+
+        self._cb_dir.setCurrentIndex(0 if str(d.get("order_direction") or "").lower() == "long" else 1)
+        kind_map = {"市价单": 0, "限价单": 1, "突破单": 2}
+        self._cb_kind.setCurrentIndex(kind_map.get(str(d.get("order_type") or ""), 0))
+        self._t_entry.setValue(_f(d.get("entry_price")))
+        self._t_stop.setValue(_f(d.get("stop_loss_price")))
+        self._t_tp.setValue(_f(d.get("take_profit_price")))
+        self._status.setText("已按当前 AI 分析填入下单参数（可手改）")
 
     def _on_connect(self) -> None:
         try:
@@ -184,33 +246,47 @@ class MT5PanelDialog(QDialog):
             self._acct_label.setText(f"连接失败：{exc}")
 
     def _on_send_order(self) -> None:
-        d = self._decision()
-        if not d:
-            QMessageBox.information(self, "MT5 下单", "没有可执行的 AI 决策，请先「提交分析」。")
+        meta = getattr(self._record, "meta", None)
+        symbol = str(getattr(meta, "symbol", "") or "")
+        if not symbol:
+            QMessageBox.information(self, "MT5 下单", "没有图表品种信息，请先在主窗口「获取数据」。")
             return
+        direction = "long" if self._cb_dir.currentText() == "多头" else "short"
+        kind_map = {"市价单": "market", "限价单": "limit", "突破单": "stop"}
+        order_kind = kind_map[self._cb_kind.currentText()]
+        entry = self._t_entry.value() if self._t_entry.value() > 0 else None
+        stop_loss = self._t_stop.value()
+        take_profit = self._t_tp.value() if self._t_tp.value() > 0 else None
+        lot = self._t_lot.value()
+
+        if stop_loss <= 0:
+            QMessageBox.warning(self, "MT5 下单", "止损价必须大于 0——不带止损的单不允许发出。")
+            return
+        if order_kind in ("limit", "stop") and not entry:
+            QMessageBox.warning(self, "MT5 下单", f"{self._cb_kind.currentText()}必须填入场价。")
+            return
+
         if self._cfg is not None and bool(getattr(self._cfg, "confirm_required", True)):
             ok = QMessageBox.question(
                 self, "确认下单",
                 "即将向 MT5 发送真实订单：\n\n"
-                f"方向：{d.get('order_direction')}　类型：{d.get('order_type')}\n"
-                f"入场：{d.get('entry_price')}　止损：{d.get('stop_loss_price')}\n"
-                f"止盈：{d.get('take_profit_price')}\n\n确认继续？",
+                f"品种：{symbol}　方向：{self._cb_dir.currentText()}　类型：{self._cb_kind.currentText()}\n"
+                f"入场：{entry if entry else '市价'}　止损：{stop_loss}\n"
+                f"止盈：{take_profit if take_profit else '无'}　手数：{lot}\n\n确认继续？",
             ) == QMessageBox.StandardButton.Yes
             if not ok:
                 return
         try:
             from pa_agent.mt5trading.mt5_bridge import OrderRequest, send_order
 
-            kind_map = {"市价单": "market", "限价单": "limit", "突破单": "stop"}
-            meta = getattr(self._record, "meta", None)
             req = OrderRequest(
-                symbol=str(getattr(meta, "symbol", "") or ""),
-                direction=str(d.get("order_direction") or "").lower(),
-                order_kind=kind_map.get(str(d.get("order_type") or ""), "market"),
-                entry=float(d["entry_price"]) if d.get("entry_price") else None,
-                stop_loss=float(d["stop_loss_price"]),
-                take_profit=float(d["take_profit_price"]) if d.get("take_profit_price") else None,
-                lot=float(getattr(self._cfg, "default_lot", 0.01)),
+                symbol=symbol,
+                direction=direction,
+                order_kind=order_kind,
+                entry=entry,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                lot=lot,
                 comment="PA_Agent",
             )
             result = send_order(req, cfg=self._cfg)
@@ -375,9 +451,23 @@ class MT5PanelDialog(QDialog):
             timeout_bars=int(getattr(self._cfg, "backtest_timeout_bars", 50)) if self._cfg else 50,
         )
 
+    def _bars_ok(self, need: int) -> bool:
+        """回测/调参前预检查 K 线数量，不足时给出明确指引。"""
+        n = len(getattr(self._frame, "bars", ()) or ())
+        if n >= need:
+            return True
+        QMessageBox.warning(
+            self, "K 线不足",
+            f"当前图表 {n} 根，至少需要 {need} 根（预热 60 + 回看窗口）。\n\n"
+            "解决办法：主窗口把「K 线根数」调大（推荐 250）后重新「获取数据」。",
+        )
+        return False
+
     def _on_backtest(self) -> None:
         if self._frame is None or not getattr(self._frame, "bars", None):
             QMessageBox.information(self, "回测", "当前没有图表数据，请先「获取数据」。")
+            return
+        if not self._bars_ok(60 + self._sp_lookback.value()):
             return
         params = self._collect_params()
         self._bt_btn.setEnabled(False)
@@ -390,6 +480,8 @@ class MT5PanelDialog(QDialog):
     def _on_tune(self) -> None:
         if self._frame is None or not getattr(self._frame, "bars", None):
             QMessageBox.information(self, "贪婪调参", "当前没有图表数据，请先「获取数据」。")
+            return
+        if not self._bars_ok(60 + self._sp_lookback.value()):
             return
         params = self._collect_params()
         self._tune_btn.setEnabled(False)
