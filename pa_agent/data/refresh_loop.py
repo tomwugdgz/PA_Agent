@@ -101,8 +101,13 @@ class RefreshLoop(QThread):
             # Exponential backoff on repeated failures to avoid hammering
             # TradingView's WebSocket endpoint
             if self._consecutive_failures > 0:
+                # 指数封顶：连续失败次数很大时 2**n 会溢出为无法转 float 的
+                # 巨大整数（OverflowError: int too large to convert to
+                # float），导致刷新线程直接崩溃。指数最多取 6
+                # （0.5 * 2**6 = 32s > 上限 10s，封顶后行为完全一致）。
+                exp = min(self._consecutive_failures - 1, 6)
                 backoff_s = min(
-                    self._BACKOFF_BASE_S * (2 ** (self._consecutive_failures - 1)),
+                    self._BACKOFF_BASE_S * (2 ** exp),
                     self._MAX_BACKOFF_S,
                 )
                 logger.debug(
