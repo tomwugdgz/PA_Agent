@@ -636,6 +636,26 @@ class MainWindow(QMainWindow):
         self._fit_chart_btn.clicked.connect(self._on_fit_chart)
         ctrl_layout.addWidget(self._fit_chart_btn)
 
+        # Laya 本地报告：与「提交分析」（DeepSeek 两阶段）完全独立，
+        # 用本地判别模型 + 确定性结构位/ATR 直接出报告与参考价格
+        self._laya_btn = QPushButton("Laya 报告")
+        self._laya_btn.setToolTip(
+            "本地 Laya 决策模型分析当前图表：输出方向/结构概率、"
+            "信号有效性，以及由结构位+ATR 确定性计算的买卖参考价。\n"
+            "首次使用需加载权重（约几十秒），之后秒级出报告。"
+        )
+        self._laya_btn.clicked.connect(self._on_laya_report)
+        ctrl_layout.addWidget(self._laya_btn)
+
+        # MT5 交易面板：自动下单（需确认）+ 确定性回测 + 生成 MQL5 EA
+        self._mt5_btn = QPushButton("MT5 交易")
+        self._mt5_btn.setToolTip(
+            "MT5 面板：连接终端、按 AI 决策下单（需确认）、"
+            "对当前图表数据跑确定性回测、一键生成 .mq5 EA。"
+        )
+        self._mt5_btn.clicked.connect(self._on_mt5_panel)
+        ctrl_layout.addWidget(self._mt5_btn)
+
         self._decision_badge = QLabel("")
         self._decision_badge.setObjectName("mutedLabel")
         ctrl_layout.addWidget(self._decision_badge)
@@ -1640,6 +1660,69 @@ class MainWindow(QMainWindow):
         if chart is not None:
             chart.fit_view()
             self._status_bar.showMessage("图表已恢复默认缩放")
+
+    def _on_laya_report(self) -> None:
+        """「Laya 报告」按钮：基于当前图表帧生成本地结构化报告。
+
+        与「提交分析」不同：不走 DeepSeek、不写 records/pending、
+        不受 API Key 限制。帧缺失时提示先获取数据。
+        """
+        from pa_agent.gui.laya_report_dialog import LayaReportDialog
+
+        if getattr(self, "_demo_mode", False):
+            QMessageBox.information(self, "Laya 报告", "演示模式下不可用。")
+            return
+        frame = getattr(self, "_last_analysis_frame", None)
+        if frame is None or not getattr(frame, "bars", None):
+            QMessageBox.information(
+                self,
+                "Laya 报告",
+                "当前没有可分析的 K 线数据。\n请先点击「获取数据」抓取当前品种的 K 线。",
+            )
+            return
+        settings = getattr(self._ctx, "settings", None)
+        if settings is None:
+            QMessageBox.warning(self, "Laya 报告", "设置未加载，无法读取 Laya 配置。")
+            return
+        laya_cfg = getattr(settings, "laya", None)
+        if laya_cfg is None or not bool(getattr(laya_cfg, "enabled", True)):
+            QMessageBox.information(
+                self, "Laya 报告",
+                "Laya 报告已在设置中关闭（config/settings.json → laya.enabled）。",
+            )
+            return
+        try:
+            dlg = LayaReportDialog(frame, settings, parent=self)
+            dlg.exec()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Laya report dialog failed: %s", exc)
+            QMessageBox.critical(self, "Laya 报告", f"打开报告失败：{exc}")
+
+    def _on_mt5_panel(self) -> None:
+        """「MT5 交易」按钮：下单 / 回测 / 生成 MQL5 四合一面板。"""
+        from pa_agent.gui.mt5_panel_dialog import MT5PanelDialog
+
+        if getattr(self, "_demo_mode", False):
+            QMessageBox.information(self, "MT5 交易", "演示模式下不可用。")
+            return
+        frame = getattr(self, "_last_analysis_frame", None)
+        record = getattr(self, "_last_analysis_record", None)
+        settings = getattr(self._ctx, "settings", None)
+        if settings is None:
+            QMessageBox.warning(self, "MT5 交易", "设置未加载。")
+            return
+        if frame is None or not getattr(frame, "bars", None):
+            QMessageBox.information(
+                self, "MT5 交易",
+                "当前没有图表数据。\n请先点击「获取数据」抓取 K 线（下单与回测都依赖它）。",
+            )
+            return
+        try:
+            dlg = MT5PanelDialog(frame, record, settings, parent=self)
+            dlg.exec()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("MT5 panel failed: %s", exc)
+            QMessageBox.critical(self, "MT5 交易", f"打开面板失败：{exc}")
 
     def _auto_resume_chart_after_analysis_enabled(self) -> bool:
         settings = getattr(self._ctx, "settings", None)
@@ -3713,6 +3796,56 @@ class MainWindow(QMainWindow):
             self._last_analysis_had_error = True
             logger.exception("Record ready handler failed: %s", exc)
 
+    def _update_experience_loop(self, record: Any) -> None:
+        """经验库闭环（写侧）：裁决 pending + 落新案例。绝不抛错。
+
+        裁决：拿当前分析帧里比案例时间戳**新**的收盘 K 线，按「TP 先到还是
+        SL 先到」判定 success/failure 并移动目录——此后 ExperienceReader
+        才会把它注入后续分析的提示词。
+        落库：把本次 stage2 决策要素写成 pending 案例，等待下一帧裁决。
+        """
+        try:
+            from pa_agent.config.paths import EXPERIENCE_DIR
+            from pa_agent.records.experience_writer import (
+                adjudicate_pending,
+                save_pending_case,
+            )
+
+            frame = getattr(self, "_last_analysis_frame", None)
+            promoted = 0
+            if frame is not None and getattr(frame, "bars", None):
+                promoted = adjudicate_pending(frame, experience_dir=EXPERIENCE_DIR)
+                if promoted:
+                    self._status_bar.showMessage(
+                        f"经验库：{promoted} 个历史案例已判定并入库", 5000
+                    )
+
+            s2 = getattr(record, "stage2_decision", None)
+            if not isinstance(s2, dict):
+                return
+            meta = getattr(record, "meta", None)
+            cycle = ""
+            s1 = getattr(record, "stage1_diagnosis", None)
+            if isinstance(s1, dict):
+                cycle = str(s1.get("cycle_position") or s1.get("market_cycle") or "")
+            direction = str(s2.get("order_direction") or "").lower() or None
+            save_pending_case(
+                experience_dir=EXPERIENCE_DIR,
+                cycle_position=cycle or "unknown",
+                symbol=str(getattr(meta, "symbol", "") or getattr(frame, "symbol", "") or ""),
+                timeframe=str(getattr(meta, "timeframe", "") or getattr(frame, "timeframe", "") or ""),
+                direction=direction or "none",
+                entry=s2.get("entry_price"),
+                stop=s2.get("stop_loss_price"),
+                target=s2.get("take_profit_price"),
+                trade_confidence=s2.get("trade_confidence"),
+                zone=str(s2.get("price_zone") or s1.get("zone") or "" if isinstance(s1, dict) else ""),
+                breakout_quality=str(s1.get("breakout_quality") or "") if isinstance(s1, dict) else "",
+                analysis_ts_ms=int(getattr(meta, "timestamp_ms", 0) or 0) or None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("经验库闭环更新失败（不影响分析）: %s", exc)
+
     def _on_record_ready_impl(self, record: Any) -> None:
         self._last_analysis_record = record
         import json as _json
@@ -3815,6 +3948,8 @@ class MainWindow(QMainWindow):
         s1_diag = getattr(record, "stage1_diagnosis", None) or {}
         self._last_analysis_record = record
         self._last_stage1_diagnosis = s1_diag if isinstance(s1_diag, dict) else None
+        # ── 经验库闭环：先用当前帧裁决历史 pending 案例，再落新 pending 案例
+        self._update_experience_loop(record)
         s2_full = getattr(record, "stage2_decision", None)
         if s2_full:
             from pa_agent.gui.stage2_payload import prepare_stage2_for_ui

@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PA_Agent 分析准确度优化方案</title>
+<style>
+  :root{
+    --bg:#F5F5F7; --fg:#1D1D1F; --accent:#FF5C1A;
+    --muted:#6E6E73; --line:#E3E3E6; --card:#FFFFFF;
+    --ok:#1E8E3E; --bad:#D93025; --warn:#B06000;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--fg);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    line-height:1.75; font-size:15px;
+  }
+  .wrap{max-width:1080px;margin:0 auto;padding:56px 28px 96px}
+  h1{font-size:30px;letter-spacing:-.4px;margin:0 0 6px;font-weight:650}
+  .sub{color:var(--muted);font-size:13.5px;margin:0 0 34px}
+  .sub b{color:var(--fg);font-weight:600}
+  h2{
+    font-size:20px;margin:52px 0 16px;font-weight:640;
+    padding-left:12px;border-left:3px solid var(--accent);
+  }
+  h3{font-size:16px;margin:30px 0 10px;font-weight:620;color:var(--fg)}
+  p{margin:10px 0}
+  table{
+    width:100%;border-collapse:collapse;margin:14px 0 8px;
+    background:var(--card);border:1px solid var(--line);border-radius:10px;
+    overflow:hidden;font-size:13.5px;
+  }
+  th{
+    background:#FAFAFC;text-align:left;padding:11px 13px;
+    font-weight:620;border-bottom:1px solid var(--line);white-space:nowrap;
+  }
+  td{padding:10px 13px;border-bottom:1px solid #F0F0F2;vertical-align:top}
+  tr:last-child td{border-bottom:none}
+  .card{
+    background:var(--card);border:1px solid var(--line);
+    border-radius:12px;padding:20px 22px;margin:16px 0;
+  }
+  .callout{
+    background:#FFF4EF;border-left:3px solid var(--accent);
+    border-radius:0 10px 10px 0;padding:16px 20px;margin:18px 0;
+  }
+  .callout .t{font-weight:650;color:var(--accent);margin-bottom:6px;font-size:14.5px}
+  code{
+    background:#F0F0F2;padding:1.5px 6px;border-radius:5px;
+    font-family:"SF Mono",Consolas,monospace;font-size:12.5px;
+  }
+  pre{
+    background:#1D1D1F;color:#F5F5F7;padding:14px 16px;border-radius:10px;
+    overflow-x:auto;font-size:12.5px;line-height:1.6;
+  }
+  .ok{color:var(--ok);font-weight:600}
+  .bad{color:var(--bad);font-weight:600}
+  .warn{color:var(--warn);font-weight:600}
+  .tag{
+    display:inline-block;padding:1px 8px;border-radius:20px;
+    font-size:11.5px;font-weight:600;background:#F0F0F2;color:var(--muted);
+  }
+  .tag.hot{background:#FFE8DF;color:var(--accent)}
+  .tag.fix{background:#E4F5E9;color:var(--ok)}
+  ul,ol{padding-left:22px}
+  li{margin:6px 0}
+  .metric{display:flex;gap:14px;flex-wrap:wrap;margin:16px 0}
+  .metric div{
+    flex:1;min-width:150px;background:var(--card);border:1px solid var(--line);
+    border-radius:10px;padding:16px 18px;
+  }
+  .metric .v{font-size:26px;font-weight:660;letter-spacing:-.5px}
+  .metric .k{font-size:12.5px;color:var(--muted);margin-top:2px}
+  footer{margin-top:56px;padding-top:20px;border-top:1px solid var(--line);color:var(--muted);font-size:12.5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>PA_Agent 分析准确度优化方案</h1>
+<p class="sub">
+  评估报告 + 优化方案（<b>本期不含代码改动</b>）　·　方向：<b>AI 分析准确度 / 结论稳定性</b>　·　验收：<b>量化对比</b><br>
+  评估日期 2026-09-30　·　代码 <code>D:/PA_Agent</code>　·　部署 Python 3.12.10
+</p>
+
+<h2>0. 一句话结论</h2>
+<div class="callout">
+  <div class="t">你感知的"结论不准/不稳定"，实证上由两类问题叠加，且优先级与直觉相反</div>
+  <p style="margin:6px 0"><b>1.（已修复，待重测）1h 周期分析 3/4 直接失败</b> —— 不是结论不准，而是<b>根本没出结论</b>。失败原因均为 <code>max_tokens=384000</code> 超出 DeepSeek 实盘上限 131072。上一轮已将上限改为 131072。</p>
+  <p style="margin:6px 0"><b>2.（结构性，未修）采样未固定导致输出随机</b> —— <code>thinking=true</code> 时程序<b>不发送 temperature</b>，模型按默认温度随机采样；且<b>无任何多次采样投票机制</b>。同一组 K 线重复分析必然得出不同结论。</p>
+  <p style="margin:8px 0 0"><b>建议顺序：先用零成本的配置层调整（A 类）拿到稳定收益，再决定是否投入代码层（B 类）。</b></p>
+</div>
+
+<h2>1. 实测基线</h2>
+<p>真实数据，来自 <code>records/pending/</code> 落盘记录，<b>零 API 消耗</b>。</p>
+
+<h3>1.1 运行成功率明细</h3>
+<table>
+  <tr><th>时间</th><th>品种</th><th>周期</th><th>结果</th><th>异常</th></tr>
+  <tr><td>21:09:01</td><td>USDCNH</td><td>1m</td><td class="ok">✅ 成功</td><td>—</td></tr>
+  <tr><td>21:09:10</td><td>USDCHF</td><td>1m</td><td class="ok">✅ 成功</td><td>—</td></tr>
+  <tr><td>21:09:22</td><td>USDJPY</td><td>1h</td><td class="bad">❌ 失败</td><td>network_error / stage1</td></tr>
+  <tr><td>21:09:28</td><td>USDCNH</td><td>1m</td><td class="ok">✅ 成功</td><td>—</td></tr>
+  <tr><td>21:09:37</td><td>USDJPY</td><td>1h</td><td class="bad">❌ 失败</td><td>network_error / stage1</td></tr>
+  <tr><td>21:09:46</td><td>USDJPY</td><td>1h</td><td class="bad">❌ 失败</td><td>network_error / stage1</td></tr>
+  <tr><td>21:09:53</td><td>USDJPY</td><td>1h</td><td class="ok">✅ 成功</td><td>—</td></tr>
+</table>
+
+<div class="metric">
+  <div><div class="v">57.1%</div><div class="k">总成功率（4/7）</div></div>
+  <div><div class="v ok">100%</div><div class="k">1m 周期（3/3）</div></div>
+  <div><div class="v bad">25%</div><div class="k">1h 周期（1/4）</div></div>
+  <div><div class="v">174,761</div><div class="k">单次 token（成功次）</div></div>
+</div>
+
+<p>三次失败的错误信息完全一致：</p>
+<pre>Error code: 400 - {'error': {'code': 'invalid_parameter_error',
+'message': '&lt;400&gt; InternalError.Algo.InvalidParameter:
+Range of max_tokens should be [1, 131072]', ...}}</pre>
+
+<h3>1.2 单次分析 Token 消耗（成功那次，实测）</h3>
+<table>
+  <tr><th>阶段</th><th>prompt</th><th>cached</th><th>completion</th><th>小计</th></tr>
+  <tr><td>stage1 市场诊断</td><td>63,228</td><td>0</td><td>4,591</td><td>67,819</td></tr>
+  <tr><td>stage2 交易决策</td><td>102,579</td><td>63,104（命中缓存）</td><td>—</td><td>—</td></tr>
+  <tr><td><b>合计</b></td><td><b>165,807</b></td><td><b>63,104</b></td><td><b>8,954</b></td><td><b>174,761</b></td></tr>
+</table>
+<p>缓存命中率 63,104 / 165,807 ≈ <b>38%</b>，DeepSeek 上下文缓存已生效（stage2 复用 stage1 前缀）。</p>
+
+<h3>1.3 输入一致性（关键对照实验）</h3>
+<div class="card">
+  4 次 <code>USDJPY_1h</code> 运行的 <code>kline_data</code> <b>MD5 哈希完全相同</b>（<code>f9ed21abcbfe</code>，100 根棒）——理想的"同输入重复实验"条件。<br>
+  但其中 3 次因 max_tokens 错误未产出结论，仅 1 次成功。<br>
+  <b>结论：现有数据无法计算"结论一致率"</b>（成功样本仅 1 个），该指标必须新建评测台实测（见 §4）。
+</div>
+
+<h2>2. 根因分析矩阵</h2>
+<p>
+  <span class="tag">【实测】</span> records 真实数据　
+  <span class="tag">【代码确认】</span> 源码可读证　
+  <span class="tag">【配置确认】</span> settings.json 实读　
+  <span class="tag hot">【推断·待验证】</span> 需实测，不作为结论依据
+</p>
+<table>
+  <tr><th>#</th><th>根因</th><th>等级</th><th>证据</th><th>影响</th><th>严重度</th><th>处置</th></tr>
+  <tr><td>R1</td><td>1h 分析因 max_tokens 超限大量失败</td><td><span class="tag">实测</span></td><td>1h 成功率 1/4，三次 400</td><td><b>没有结论</b>，体感为"点几次才出一次"</td><td class="bad">高</td><td><span class="tag fix">已修</span>待重测</td></tr>
+  <tr><td>R2</td><td>thinking=true 时不发送 temperature</td><td><span class="tag">代码确认</span></td><td><code>deepseek_client.py:583</code><br>配置 <code>thinking: true</code></td><td><b>输出随机</b>，同输入必得不同结论</td><td class="bad">高</td><td>B1</td></tr>
+  <tr><td>R3</td><td>无自洽/多次采样投票</td><td><span class="tag">代码确认</span></td><td>全库无 consensus/vote（仅一个<b>确定性</b>5 信号投票，属特征计算）</td><td>单次采样即最终结论，无纠错</td><td class="bad">高</td><td>B2</td></tr>
+  <tr><td>R4</td><td>一致性/语义校验全部关闭</td><td><span class="tag">配置确认</span></td><td>4 项 checks 全 <code>false</code>；<code>normalization_mode: lenient</code></td><td>自相矛盾结论<b>被直接放行</b></td><td class="warn">中高</td><td>A2（零代码）</td></tr>
+  <tr><td>R5</td><td>周期过短（1m）+ 样本仅 100 根</td><td><span class="tag">配置确认</span></td><td><code>last_timeframe: 1m</code><br><code>analysis_bar_count: 100</code></td><td>100 分钟数据，噪音主导，PA 结构分析不可靠</td><td class="warn">中高</td><td>A1（零代码）</td></tr>
+  <tr><td>R6</td><td>不复用上轮结论</td><td><span class="tag">配置确认</span></td><td><code>keep_analysis: false</code><br><code>incremental_max_new_bars: 10</code></td><td>每根新 K 线独立重新采样，结论<b>反复横跳</b></td><td class="warn">中</td><td>A4（零代码）</td></tr>
+  <tr><td>R7</td><td>语义类错误仅重试 1 次</td><td><span class="tag">配置确认</span></td><td><code>retry_max_semantic: 1</code></td><td>矛盾结论收敛机会少</td><td>中低</td><td>A3</td></tr>
+  <tr><td>R8</td><td>context_window 疑似虚高</td><td><span class="tag hot">推断</span></td><td>配置值 2,000,000</td><td>token 预算与截断策略失真</td><td>待核</td><td>A5</td></tr>
+  <tr><td>R9</td><td>模型 ID 与文档默认不一致</td><td><span class="tag hot">推断</span></td><td>配置 <code>deepseek-flash</code><br>文档默认 <code>deepseek-v4-flash</code></td><td>若路由到较弱模型，准确度受影响</td><td>待核</td><td>A5</td></tr>
+  <tr><td>R10</td><td>1h 的 prompt 远大于 1m</td><td><span class="tag">实测</span></td><td>1h 成功次 prompt 165,807</td><td>与 R1 叠加更易触发上限</td><td class="warn">中</td><td>A1 + R1</td></tr>
+</table>
+
+<h2>3. 优化方案</h2>
+
+<h3>3.1 A 类：配置层调整（<span class="tag fix">零代码</span>可立即执行）</h3>
+<table>
+  <tr><th>#</th><th>参数</th><th>当前</th><th>建议</th><th>理由</th><th>预期收益</th></tr>
+  <tr><td>A1</td><td><code>last_timeframe</code><br><code>analysis_bar_count</code></td><td>1m / 100</td><td><b>15m 或 1h / 150</b></td><td>PA（Al Brooks）依赖趋势结构、通道、MTR，1m 噪音主导</td><td><b>准确度提升最显著</b></td></tr>
+  <tr><td>A2</td><td>4 项 coherence/semantic checks<br><code>normalization_mode</code></td><td>全 false<br>lenient</td><td><b>全 true</b><br><b>strict</b></td><td>拦截自相矛盾与越界输出；当前等于"无质检出厂"</td><td>减少荒谬/矛盾结论</td></tr>
+  <tr><td>A3</td><td><code>retry_max_semantic</code></td><td>1</td><td><b>2~3</b></td><td>给语义矛盾更多收敛机会</td><td>矛盾结论减少</td></tr>
+  <tr><td>A4</td><td><code>keep_analysis</code></td><td>false</td><td><b>true</b></td><td>复用上轮结论做增量分析，避免每次从零采样</td><td>相邻结论连续性显著提升</td></tr>
+  <tr><td>A5</td><td><code>context_window</code> / <code>model</code></td><td>2000000<br>deepseek-flash</td><td>核实真实值<br>确认是否应为 v4-flash</td><td>预算与路由正确性</td><td>避免隐性降级</td></tr>
+  <tr><td>A6</td><td><code>refresh_interval_ms</code></td><td>1000</td><td>按周期调（1m→30~60s）</td><td>1m 下 1 秒刷新但 K 线 60 秒才更新，无效轮询</td><td>降成本/限流风险</td></tr>
+</table>
+<p>A 类<b>不需要我改任何代码</b>：你可直接在 GUI「设置」里改，或授权我批量写入 <code>config/settings.json</code>（你的本地配置，非上游代码）。</p>
+
+<h3>3.2 B 类：代码层（<span class="tag hot">需你确认后我才动手</span>）</h3>
+<table>
+  <tr><th>#</th><th>改动</th><th>目的</th><th>代价</th><th>风险</th></tr>
+  <tr><td>B1</td><td>thinking 开启时也固定 <code>temperature=0</code>（或 <code>seed</code>）</td><td>从根上消除采样随机性</td><td>极低</td><td>【推断】DeepSeek 在 adaptive thinking 下<b>可能不接受</b> temperature；需 1 次实测确认</td></tr>
+  <tr><td>B2</td><td>自洽投票：同输入 N=3，关键字段多数表决，分歧降级为「不下单」</td><td>用统计手段稳定结论</td><td>token ×3（17.5 万 → 约 52 万）</td><td>成本显著上升，需评估是否值得</td></tr>
+  <tr><td>B3</td><td>结论缓存：K 线序列哈希 → 复用历史结论</td><td>相同输入直接返回，杜绝横跳且省 token</td><td>低</td><td>需定义失效条件（新 K 线到达即失效）</td></tr>
+  <tr><td>B4</td><td>增强 coherence checks 覆盖项</td><td>提高拦截率</td><td>低</td><td>可能误杀，需配合 A3 重试</td></tr>
+</table>
+
+<h3>3.3 C 类：评测体系（量化验收的前提）</h3>
+<div class="card">
+  现有数据<b>不足以</b>给出"结论一致率"（成功样本只有 1 个）。必须建可复现评测台：<br>
+  ① 固定一段 K 线（从 records 导出，输入哈希固定）→ ② 重复跑 <b>N=10</b> 次完整两阶段分析 → ③ 统计各关键字段一致率。
+</div>
+
+<h2>4. 量化验收方案</h2>
+<h3>4.1 指标定义</h3>
+<table>
+  <tr><th>指标</th><th>定义</th><th>采集方式</th><th>基线（实测）</th><th>目标</th></tr>
+  <tr><td><b>成功率</b></td><td>完整产出结论次数 / 总次数</td><td>records 异常统计</td><td class="bad">57.1%（1h 仅 25%）</td><td><b>≥95%</b></td></tr>
+  <tr><td>诊断一致率</td><td>cycle_position/direction/market_phase 众数频次 / N</td><td>评测台 N=10</td><td>未测（需建台）</td><td>≥80%</td></tr>
+  <tr><td>决策一致率</td><td>order_type + order_direction 众数频次 / N</td><td>评测台 N=10</td><td>未测</td><td>≥80%</td></tr>
+  <tr><td>数值稳定性</td><td>entry/stop/take_profit 相对标准差</td><td>评测台</td><td>未测</td><td>≤5%</td></tr>
+  <tr><td>置信度波动</td><td>diagnosis_confidence 极差</td><td>评测台</td><td>单样本 60</td><td>极差 ≤15</td></tr>
+  <tr><td>单次 token</td><td>usage_total.total_tokens</td><td>records</td><td><b>174,761</b></td><td>不显著上升（B2 除外）</td></tr>
+  <tr><td>缓存命中率</td><td>cached_prompt / prompt_total</td><td>records</td><td><b>38%</b></td><td>保持 ≥35%</td></tr>
+</table>
+
+<h3>4.2 测量流程（三步对比）</h3>
+<ol>
+  <li><b>基线采集</b>：当前配置（含已修 max_tokens）跑 N=10 → <code>BASE</code></li>
+  <li><b>A 类生效后</b>：仅改配置，同样 N=10 → <code>A</code></li>
+  <li><b>B 类生效后</b>（若执行）：再跑 N=10 → <code>B</code></li>
+</ol>
+<p>输出对比矩阵 <code>BASE vs A vs B</code>，逐指标给出差值与提升幅度。</p>
+
+<h3>4.3 成本预估</h3>
+<div class="metric">
+  <div><div class="v">17.5 万</div><div class="k">单次分析 token</div></div>
+  <div><div class="v">175 万</div><div class="k">每组 N=10</div></div>
+  <div><div class="v">525 万</div><div class="k">三组合计（BASE/A/B）</div></div>
+  <div><div class="v">38%</div><div class="k">缓存命中（实际计费更低）</div></div>
+</div>
+
+<h2>5. 实施路线图</h2>
+<table>
+  <tr><th>阶段</th><th>内容</th><th>改代码</th><th>前置</th></tr>
+  <tr><td><b>P0</b></td><td>重测验证 max_tokens 修复（1h 跑 3~5 次）</td><td>否</td><td>无（重启程序即可）</td></tr>
+  <tr><td><b>P1</b></td><td>A1/A2/A3/A4 配置调整</td><td>否（改 settings.json 或 GUI）</td><td>你确认建议值</td></tr>
+  <tr><td><b>P2</b></td><td>建评测台，采集 BASE 基线（N=10）</td><td>是（新增独立评测脚本，不动主程序）</td><td>你确认 API 消耗</td></tr>
+  <tr><td><b>P3</b></td><td>依据 BASE 决定 B1/B2/B3</td><td>是</td><td>P2 结果</td></tr>
+  <tr><td><b>P4</b></td><td>复测 A/B 组，出量化对比报告</td><td>否</td><td>P1/P3 完成</td></tr>
+</table>
+
+<h2>6. 风险与副作用</h2>
+<table>
+  <tr><th>风险</th><th>说明</th><th>缓解</th></tr>
+  <tr><td>strict 校验可能误杀</td><td>轻微偏差会直接失败</td><td>配合 A3 提高语义重试次数</td></tr>
+  <tr><td>B2 自洽投票成本 ×3</td><td>单次 token 17.5 万 → 约 52 万</td><td>可只在关键决策启用，或 N=2</td></tr>
+  <tr><td>A1 提高周期改变交易节奏</td><td>1h 结论不适合短线</td><td>按你实际交易周期定，勿盲从建议</td></tr>
+  <tr><td>本地改动与上游冲突</td><td>第三方 AGPL 仓库</td><td>本期不改代码；后续若改，建议独立分支</td></tr>
+</table>
+
+<h2>7. 需要你拍板的问题</h2>
+<div class="card">
+  <ol>
+    <li><b>P0 是否现在做</b>：重启程序、用 1h 跑 3~5 次，确认 max_tokens 修复生效？（零成本）</li>
+    <li><b>A 类配置是否授权我写入</b>：我直接改 <code>config/settings.json</code>（A1~A4），还是你自己在 GUI 改？</li>
+    <li><b>周期定多少</b>：你的实际交易周期？决定 A1 的 <code>last_timeframe</code>（我暂推 15m/1h）</li>
+    <li><b>是否允许消耗 API 跑评测</b>：批准几组（每组 10 次 ≈ 175 万 token）？</li>
+    <li><b>B 类是否要做</b>：等 BASE 基线出来再定，还是现在直接上 B1（固定 temperature）？</li>
+  </ol>
+</div>
+
+<footer>
+  本报告实测数据均取自 <code>D:/PA_Agent/records/pending/</code> 的真实落盘记录；标注【推断·待验证】的条目未经实测确认，不作为结论依据。
+</footer>
+
+</div>
+</body>
+</html>

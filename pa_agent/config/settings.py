@@ -154,6 +154,71 @@ class PushPlusSettings(BaseModel):
     token: str = ""
 
 
+class LayaSettings(BaseModel):
+    """Laya System-1 决策模型设置（本地离线推理，与 DeepSeek 两阶段分析解耦）。
+
+    Laya 是非自回归判别模型，只输出 choice / score / noul 三种结构化原语，
+    不产出自然语言文本，因此：
+      - 「分析报告」正文由本地代码渲染；
+      - 「买入/卖出价格」由确定性结构位 + ATR 计算；
+      -     Laya 只负责提供方向/结构/信号有效性的**概率**。
+    """
+    model_config = ConfigDict(extra="ignore", protected_namespaces=())
+
+    #: 总开关。关闭时工具栏「Laya 报告」按钮置灰。
+    enabled: bool = True
+    #: 权重根目录（内含 multilingual/ 子目录）。Agent 检测到本地目录存在即跳过联网下载。
+    model_dir: str = r"C:\Users\wolf2\laya-models\laya"
+    #: 权重子目录：multilingual 支持中文（含 CJK 路由），"" 为英文档
+    subfolder: str = "multilingual"
+    #: 推理设备：auto=有 CUDA 就用 GPU，否则 CPU
+    device: str = "auto"
+    #: 低置信度门槛：低于此值的答案在报告中标注「不可信」，不参与价格建议生成
+    min_confidence: float = Field(default=0.35, ge=0.0, le=1.0)
+    #: 是否把每次 Laya 调用写入标注数据集（用于后续微调），见 ai/laya_annotation.py
+    collect_annotations: bool = True
+
+    #: ── 定价参数（混合口径：结构优先 + ATR 兜底） ─────────────────────────
+    #: 挂单相对结构位的偏移倍数 × ATR（做多挂 support + k*ATR）
+    entry_offset_atr: float = Field(default=0.10, ge=0.0, le=2.0)
+    #: 止损相对结构失效位的缓冲倍数 × ATR
+    stop_buffer_atr: float = Field(default=0.25, ge=0.0, le=3.0)
+    #: 无 measured_move 时的兜底目标：R 倍数（R = |entry - stop|）
+    fallback_target_r: float = Field(default=2.0, ge=0.5, le=10.0)
+    #: 无结构位时的纯 ATR 兜底止损倍数
+    fallback_stop_atr: float = Field(default=1.0, ge=0.1, le=5.0)
+
+
+class MT5Settings(BaseModel):
+    """MT5 自动交易设置（Python 直连 order_send）。
+
+    安全设计：下单**必须**经 GUI 确认弹窗，无任何自动循环下单路径；
+    enabled 默认 False，需用户显式开启。
+    """
+    model_config = ConfigDict(extra="ignore", protected_namespaces=())
+
+    #: 总开关：False 时 MT5 面板只读（连接/账户信息可用，下单按钮禁用）
+    enabled: bool = False
+    #: EA/订单魔号：识别本程序所下订单，便于平仓与统计
+    magic: int = Field(default=20260930, ge=1)
+    #: 默认下单手数
+    default_lot: float = Field(default=0.01, gt=0.0)
+    #: 最大允许点差（point 为单位）；实际点差超过此值拒绝下单，0=不检查
+    max_spread_points: int = Field(default=0, ge=0)
+    #: 下单前强制确认弹窗（建议保持 True；关闭属高风险行为）
+    confirm_required: bool = True
+    #: 挂单有效期（根 K 线）；到期未成交自动撤单，0=不过期（由 EA 端 EXP_DOU 条件控制）
+    pending_expiry_bars: int = Field(default=12, ge=0, le=500)
+    #: MT5 终端路径（留空 = 自动附加到已登录的运行中终端）
+    terminal_path: str = ""
+    #: 回测参数：信号回看窗口（根）
+    backtest_lookback: int = Field(default=100, ge=20, le=2000)
+    #: 回测：超时平仓根数（TP/SL 都没触发时按收盘价离场）
+    backtest_timeout_bars: int = Field(default=50, ge=5, le=1000)
+    #: 回测：单边成本（点/笔，模拟点差+滑点），从盈利中扣除
+    backtest_cost_points: int = Field(default=10, ge=0)
+
+
 class Settings(BaseModel):
     """Root settings object persisted to config/settings.json."""
     model_config = ConfigDict(extra="ignore")
@@ -165,6 +230,8 @@ class Settings(BaseModel):
     feishu: FeishuSettings = Field(default_factory=FeishuSettings)
     pushplus: PushPlusSettings = Field(default_factory=PushPlusSettings)
     tushare: TushareSettings = Field(default_factory=TushareSettings)
+    laya: LayaSettings = Field(default_factory=LayaSettings)
+    mt5trading: MT5Settings = Field(default_factory=MT5Settings)
 
 
 def provider_api_key_configured(settings: Settings | None) -> bool:

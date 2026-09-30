@@ -87,3 +87,10 @@ docs/changelog/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# ── 2026-09-30 新增：本地大文件与验证产物 ────────────────────────────────────
+tools/_torch_cu130/
+tools/_e2e_report/
+tools/_mq5_check/
+# 含明文密钥的历史配置备份（上游遗留，禁止入库）
+config/settings.json.bak*

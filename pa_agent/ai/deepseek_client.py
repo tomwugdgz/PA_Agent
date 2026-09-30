@@ -223,8 +223,12 @@ def _is_bai(base_url: str) -> bool:
 
 # Packy claude-officially returns 400 if max_tokens exceeds model output cap.
 _PACKY_CLAUDE_MAX_OUTPUT_TOKENS = 128_000
-# DeepSeek API: max_tokens must be in [1, 393216].
-_DEEPSEEK_MAX_OUTPUT_TOKENS = 393_216
+# DeepSeek native API (api.deepseek.com), model deepseek-v4-flash:
+# live API enforces max_tokens in [1, 131072]. Sending a larger value
+# (e.g. the previously assumed 393216) returns HTTP 400
+# invalid_parameter_error ("Range of max_tokens should be [1, 131072]").
+# 131072 is verified safe for v4-flash and never triggers a 400.
+_DEEPSEEK_MAX_OUTPUT_TOKENS = 131_072
 # SenseNova API: max_tokens is model-specific (per /v1/models max_output_length).
 # glm-5.2: [1, 131072]; deepseek-v4-flash / sensenova-*-flash-lite: [1, 65536].
 # Global gateway hard cap observed on several OpenAI-compatible proxies (incl. SenseNova).
@@ -349,7 +353,12 @@ def _provider_max_output_tokens(settings: AIProviderSettings) -> int:
     elif _is_mimo(settings):
         cap = mimo_max_output_tokens(settings.model)
     else:
-        cap = _PRACTICAL_UNLIMITED_MAX_TOKENS
+        # Unknown gateway: still honor DeepSeek-family model caps, since DeepSeek-backed
+        # proxies not matched by the branches above enforce the same [1, 131072] limit.
+        if _is_deepseek_model(model):
+            cap = _DEEPSEEK_MAX_OUTPUT_TOKENS
+        else:
+            cap = _PRACTICAL_UNLIMITED_MAX_TOKENS
     return min(cap, _GLOBAL_MAX_OUTPUT_TOKENS)
 
 
