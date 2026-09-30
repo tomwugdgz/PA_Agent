@@ -57,6 +57,27 @@ class BacktestWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class TunerWorker(QThread):
+    """后台跑贪婪调参（几十次确定性回测，秒级）。"""
+
+    ready = pyqtSignal(object)    # TuningResult
+    failed = pyqtSignal(str)
+
+    def __init__(self, frame: Any, params: Any, parent: Any = None) -> None:
+        super().__init__(parent)
+        self._frame = frame
+        self._params = params
+
+    def run(self) -> None:
+        try:
+            from pa_agent.journal.greedy_tuner import greedy_tune
+
+            self.ready.emit(greedy_tune(self._frame, self._params))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("TunerWorker failed: %s", exc)
+            self.failed.emit(str(exc))
+
+
 class MT5PanelDialog(QDialog):
     """MT5 四合一面板（模态）。"""
 
@@ -69,6 +90,8 @@ class MT5PanelDialog(QDialog):
         self._settings = settings
         self._cfg = getattr(settings, "mt5trading", None)
         self._bt_worker: BacktestWorker | None = None
+        self._tune_worker: TunerWorker | None = None
+        self._last_tuning: Any = None
         self._connected: bool = False
 
         root = QVBoxLayout(self)
@@ -310,6 +333,22 @@ class MT5PanelDialog(QDialog):
         self._bt_btn.clicked.connect(self._on_backtest)
         v.addWidget(self._bt_btn)
 
+        # 贪婪调参：AI 在当前图表历史窗口上自动搜索更优参数（只接受回测证据支持的改进）
+        tune_row = QHBoxLayout()
+        self._tune_btn = QPushButton("贪婪调参（AI 自动优化）")
+        self._tune_btn.setToolTip(
+            "以回测净收益 R 为目标，对止损缓冲/最小止损/目标R/挂单偏移做贪婪坐标下降；\n"
+            "每次评估写入运行记录，找到更优参数后可一键应用。"
+        )
+        self._tune_btn.clicked.connect(self._on_tune)
+        self._apply_btn = QPushButton("应用最优参数到设置")
+        self._apply_btn.setEnabled(False)
+        self._apply_btn.clicked.connect(self._on_apply_tuned)
+        tune_row.addWidget(self._tune_btn)
+        tune_row.addWidget(self._apply_btn)
+        tune_row.addStretch()
+        v.addLayout(tune_row)
+
         self._bt_summary = QTextBrowser()
         self._bt_summary.setMaximumHeight(160)
         v.addWidget(self._bt_summary)
@@ -322,13 +361,11 @@ class MT5PanelDialog(QDialog):
         v.addWidget(self._bt_table, 1)
         return w
 
-    def _on_backtest(self) -> None:
-        if self._frame is None or not getattr(self._frame, "bars", None):
-            QMessageBox.information(self, "回测", "当前没有图表数据，请先「获取数据」。")
-            return
+    def _collect_params(self) -> "Any":
+        """从面板控件收集 BacktestParams（回测与调参共用同一口径）。"""
         from pa_agent.mt5trading.backtest import BacktestParams
 
-        params = BacktestParams(
+        return BacktestParams(
             lookback=self._sp_lookback.value(),
             stop_buffer_atr=self._sp_stop.value(),
             target_r=self._sp_target.value(),
@@ -337,6 +374,12 @@ class MT5PanelDialog(QDialog):
             enable_breakout=self._cb_break.isChecked(),
             timeout_bars=int(getattr(self._cfg, "backtest_timeout_bars", 50)) if self._cfg else 50,
         )
+
+    def _on_backtest(self) -> None:
+        if self._frame is None or not getattr(self._frame, "bars", None):
+            QMessageBox.information(self, "回测", "当前没有图表数据，请先「获取数据」。")
+            return
+        params = self._collect_params()
         self._bt_btn.setEnabled(False)
         self._status.setText("回测运行中…")
         self._bt_worker = BacktestWorker(self._frame, params, parent=self)
@@ -344,9 +387,73 @@ class MT5PanelDialog(QDialog):
         self._bt_worker.failed.connect(self._on_bt_failed)
         self._bt_worker.start()
 
+    def _on_tune(self) -> None:
+        if self._frame is None or not getattr(self._frame, "bars", None):
+            QMessageBox.information(self, "贪婪调参", "当前没有图表数据，请先「获取数据」。")
+            return
+        params = self._collect_params()
+        self._tune_btn.setEnabled(False)
+        self._bt_btn.setEnabled(False)
+        self._apply_btn.setEnabled(False)
+        self._status.setText("贪婪调参运行中（几十次回测，约几十秒）…")
+        self._tune_worker = TunerWorker(self._frame, params, parent=self)
+        self._tune_worker.ready.connect(self._on_tune_ready)
+        self._tune_worker.failed.connect(self._on_tune_failed)
+        self._tune_worker.start()
+
+    def _on_tune_ready(self, result: Any) -> None:
+        self._tune_btn.setEnabled(True)
+        self._bt_btn.setEnabled(True)
+        self._status.setText("贪婪调参完成")
+        self._last_tuning = result
+        self._apply_btn.setEnabled(bool(result.improved))
+        self._bt_summary.setHtml(f"<pre>{result.summary_text()}</pre>")
+        self._tune_worker = None
+
+    def _on_tune_failed(self, msg: str) -> None:
+        self._tune_btn.setEnabled(True)
+        self._bt_btn.setEnabled(True)
+        self._status.setText("贪婪调参失败")
+        self._bt_summary.setHtml(f"<p style='color:#B91C1C'>{msg}</p>")
+        self._tune_worker = None
+
+    def _on_apply_tuned(self) -> None:
+        """把本轮最优参数写回 settings.laya 并持久化到 settings.json。"""
+        result = getattr(self, "_last_tuning", None)
+        if result is None or not result.improved:
+            return
+        try:
+            from pa_agent.config.paths import SETTINGS_JSON_PATH
+            from pa_agent.config.settings import save_settings
+            from pa_agent.journal.greedy_tuner import apply_to_settings
+
+            changed = apply_to_settings(self._settings, result)
+            save_settings(self._settings, SETTINGS_JSON_PATH)
+            QMessageBox.information(
+                self, "应用参数",
+                "已写入 config/settings.json（重启后仍生效）：\n"
+                + "\n".join(changed),
+            )
+            self._status.setText("；".join(changed))
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "应用参数", f"写入设置失败：{exc}")
+
     def _on_bt_ready(self, result: Any) -> None:
         self._bt_btn.setEnabled(True)
         self._status.setText("回测完成")
+        # 回测层记录（旁路，失败静默）
+        try:
+            from dataclasses import asdict
+
+            from pa_agent.journal.layer_journal import log_backtest
+
+            log_backtest(
+                symbol=result.symbol, timeframe=result.timeframe,
+                kind="backtest_run", params=asdict(result.params),
+                metrics=result.metrics, extra={"role": "manual"},
+            )
+        except Exception:  # noqa: BLE001
+            pass
         self._bt_summary.setHtml(f"<pre>{result.summary_text()}</pre>")
         self._bt_table.setRowCount(len(result.trades))
         for r, t in enumerate(result.trades):
@@ -367,9 +474,9 @@ class MT5PanelDialog(QDialog):
         self._bt_worker = None
 
     def closeEvent(self, event: Any) -> None:  # noqa: N802
-        w = self._bt_worker
-        if w is not None and w.isRunning():
-            w.wait(1500)
+        for w in (self._bt_worker, self._tune_worker):
+            if w is not None and w.isRunning():
+                w.wait(1500)
         super().closeEvent(event)
 
 

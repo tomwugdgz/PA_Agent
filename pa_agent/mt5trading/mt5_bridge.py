@@ -173,7 +173,7 @@ def _filling_name(v: int) -> str:
     return {0: "FOK", 1: "IOC", 2: "RETURN"}.get(v, str(v))
 
 
-def send_order(req: OrderRequest, *, cfg: Any) -> OrderResult:
+def _send_order_impl(req: OrderRequest, *, cfg: Any) -> OrderResult:
     """执行一次下单。最后一道机器校验在此完成。
 
     Raises:
@@ -265,3 +265,43 @@ def send_order(req: OrderRequest, *, cfg: Any) -> OrderResult:
         return OrderResult(False, last_code, None, f"下单失败 retcode={last_code}：{last_msg}")
     finally:
         pass  # 保持连接供后续查询；进程退出由 shutdown() 兜底
+
+
+def send_order(req: OrderRequest, *, cfg: Any) -> OrderResult:
+    """``_send_order_impl`` 的记录包装：执行层 journal 落盘 + 原样返回。
+
+    成功 / 被拒 / 抛异常三种结局都记（异常记为 order_rejected + message），
+    journal 自身失败被吞掉，绝不影响下单主流程。
+    """
+    try:
+        result = _send_order_impl(req, cfg=cfg)
+    except MT5BridgeError as exc:
+        _journal_execution(req, ok=False, retcode=None, ticket=None,
+                           message=str(exc))
+        raise
+    except Exception as exc:  # noqa: BLE001 - 非 MT5BridgeError 的意外异常也记
+        _journal_execution(req, ok=False, retcode=None, ticket=None,
+                           message=f"意外异常：{exc}")
+        raise
+    _journal_execution(req, ok=result.ok, retcode=result.retcode,
+                       ticket=result.order_ticket, message=result.message)
+    return result
+
+
+def _journal_execution(
+    req: OrderRequest, *, ok: bool, retcode: int | None,
+    ticket: int | None, message: str,
+) -> None:
+    """执行层记录（旁路，失败静默）。"""
+    try:
+        from pa_agent.journal.layer_journal import log_execution
+
+        log_execution(
+            symbol=req.symbol, ok=ok, retcode=retcode,
+            direction=req.direction, order_kind=req.order_kind,
+            entry=req.entry, stop_loss=req.stop_loss,
+            take_profit=req.take_profit, lot=req.lot,
+            ticket=ticket, message=message,
+        )
+    except Exception:  # noqa: BLE001
+        pass

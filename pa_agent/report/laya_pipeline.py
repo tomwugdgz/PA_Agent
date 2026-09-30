@@ -204,7 +204,66 @@ def generate_report(frame: Any, settings: Any) -> LayaReport:
                 "device": engine.device,
             },
         )
+
+    # ── 五层运行记录：数据 / 决策 / 风控（失败静默，绝不影响报告）
+    _journal_report(report=report, frame=frame, cfg=cfg,
+                    device=engine.device, latency_ms=latency_ms,
+                    n_errors=len(errors))
     return report
+
+
+def _journal_report(
+    *, report: LayaReport, frame: Any, cfg: Any,
+    device: str, latency_ms: float, n_errors: int,
+) -> None:
+    """把本次报告的关键信息写入 journal 的 data / decision / risk 三层。
+
+    任何异常都吞掉——journal 是纯外围旁路，主流程绝不因它失败。
+    """
+    try:
+        from pa_agent.journal.layer_journal import (
+            log_data, log_decision, log_risk,
+        )
+
+        sym, tf = report.symbol, report.timeframe
+        # 数据层：输入快照
+        log_data(
+            symbol=sym, timeframe=tf,
+            n_bars=len(getattr(frame, "bars", ()) or ()),
+            close=report.close, atr=report.atr,
+            device=device, latency_ms=latency_ms, n_errors=n_errors,
+        )
+        # 决策层：答题摘要 + 双向价格计划摘要
+        answers = {
+            qid: {"kind": a.kind, "value": a.value, "confidence": round(a.confidence, 3)}
+            for qid, a in report.prediction.answers.items()
+        }
+        plans = {}
+        for name, plan in (("long", report.long_plan), ("short", report.short_plan)):
+            plans[name] = {
+                "actionable": plan.actionable, "reason": plan.reason,
+                "entry": plan.entry, "stop": plan.stop, "target": plan.target,
+                "rr": plan.rr_ratio,
+                "fallback": bool(plan.entry_fallback or plan.stop_fallback
+                                 or plan.target_fallback),
+            }
+        log_decision(symbol=sym, timeframe=tf, source="laya",
+                     answers=answers, plans=plans)
+        # 风控层：计划告警 + 低置信度 + 最大盈亏比
+        warnings: list[str] = []
+        max_rr: float | None = None
+        low_conf = False
+        dire = report.prediction.answers.get("方向")
+        if dire is not None and not dire.reliable:
+            low_conf = True
+        for plan in (report.long_plan, report.short_plan):
+            warnings.extend(plan.notes)
+            if plan.rr_ratio is not None:
+                max_rr = plan.rr_ratio if max_rr is None else max(max_rr, plan.rr_ratio)
+        log_risk(symbol=sym, timeframe=tf, warnings=warnings,
+                 low_confidence=low_conf, max_rr=max_rr)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("journal 五层记录失败（不影响报告）: %s", exc)
 
 
 def _annotate(plan: Any, note: str) -> Any:
