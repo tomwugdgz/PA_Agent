@@ -235,11 +235,19 @@ class MT5PanelDialog(QDialog):
     def _import_analysis(self) -> None:
         """把主窗口分析结果填进下单参数。
 
-        来源优先级：
-        1. AI 决策（两阶段分析 stage2_decision）——有可执行订单时直接用；
-        2. 最近一次 Laya 报告（logs/laya_latest.json）——按报告方向取
-           对应价格计划，订单类型默认「限价单」（结构位挂单口径，可改）。
+        来源优先级（从高到低）：
+        1. **实时图表数据**：从主窗口当前 frame 取最新 K 线 + 指标，
+           用确定性规则算出入场/止损/止盈（与 Laya 报告同源但保证最新）
+        2. AI 决策（两阶段分析 stage2_decision）——有可执行订单时用
+        3. 最近一次 Laya 报告（logs/laya_latest.json）——按报告方向取
+           对应价格计划，订单类型默认「限价单」（结构位挂单口径，可改）
         """
+        # 优先：用实时图表数据算价格计划
+        realtime_plan = self._build_realtime_plan()
+        if realtime_plan is not None:
+            self._fill_from_realtime_plan(realtime_plan)
+            return
+
         d = self._decision()
         if d and str(d.get("order_type") or "") in ("限价单", "突破单", "市价单"):
             self._fill_from_decision_dict(d, source="AI 决策")
@@ -258,6 +266,63 @@ class MT5PanelDialog(QDialog):
             "· AI 决策为 no_order，且\n"
             "· 本会话尚未生成 Laya 报告（或报告无可执行价格计划）。\n\n"
             "请先在主窗口「提交分析」或生成「Laya 报告」，或手动设置参数。")
+
+    def _build_realtime_plan(self) -> dict[str, Any] | None:
+        """从主窗口当前 frame 用确定性规则算价格计划（保证最新）。"""
+        try:
+            from pa_agent.ai.market_features import compute_simple_market_features
+            from pa_agent.report.laya_pricing import plan_long, plan_short
+            from pa_agent.util.price_tick import infer_price_tick_from_frame
+
+            frame = self._frame
+            if frame is None or not getattr(frame, "bars", None):
+                return None
+
+            close = float(frame.bars[0].close)
+            atr = None
+            indicators = getattr(frame, "indicators", None)
+            atr14 = getattr(indicators, "atr14", None) if indicators is not None else None
+            if atr14:
+                try:
+                    atr = float(atr14[0])
+                except (TypeError, ValueError):
+                    atr = None
+
+            # 如果没有 ATR，无法算价格计划，返回 None 让后续逻辑处理
+            if atr is None or atr <= 0:
+                return None
+
+            features = compute_simple_market_features(frame)
+            tick = infer_price_tick_from_frame(frame)
+
+            # 用 Laya 定价引擎的确定性规则（结构位优先 + ATR 兜底）
+            long_p = plan_long(close=close, atr=atr, features=features,
+                              cfg=None, tick=tick)
+            short_p = plan_short(close=close, atr=atr, features=features,
+                                cfg=None, tick=tick)
+
+            # 选可执行的那个计划
+            if long_p.actionable:
+                return {"direction": "long", "plan": long_p}
+            elif short_p.actionable:
+                return {"direction": "short", "plan": short_p}
+            return None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _fill_from_realtime_plan(self, data: dict[str, Any]) -> None:
+        """实时图表数据 → 表单。"""
+        direction = data["direction"]
+        plan = data["plan"]
+
+        self._cb_dir.setCurrentIndex(0 if direction == "long" else 1)
+        self._cb_kind.setCurrentIndex(1)  # 限价单：结构位挂单口径
+        self._t_entry.setValue(plan.entry if plan.entry else 0.0)
+        self._t_stop.setValue(plan.stop if plan.stop else 0.0)
+        self._t_tp.setValue(plan.target if plan.target else 0.0)
+        self._status.setText(
+            f"已导入实时图表数据（{direction}，限价单，可手改）"
+        )
 
     def _fill_from_decision_dict(self, d: dict[str, Any], *, source: str) -> None:
         """AI 决策 → 表单（手数不动）。"""
