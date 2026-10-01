@@ -74,6 +74,15 @@ class LayaReport:
         }
 
 
+def _pred_get(pred, key, default=None):
+    """兼容 dict / dataclass / SimpleNamespace 的 get 操作。"""
+    if hasattr(pred, "get"):
+        return _pred_get(pred, key, default)
+    answers = getattr(pred, "answers", {})
+    if isinstance(answers, dict):
+        return answers.get(key, default)
+    return default
+
 def _plan_dict(p: PricePlan) -> dict[str, Any]:
     return {
         "direction": p.direction,
@@ -100,9 +109,9 @@ def render_markdown(r: LayaReport) -> str:
     """人类可读的中文报告（纯文本 Markdown，可直接粘贴/存档）。"""
     L: list[str] = []
     pred = r.prediction
-    struct = pred.get("周期结构")
-    dire = pred.get("方向")
-    sig = pred.get("信号有效")
+    struct = _pred_get(pred, "周期结构")
+    dire = _pred_get(pred, "方向")
+    sig = _pred_get(pred, "信号有效")
 
     L.append(f"# Laya 市场分析报告 · {r.symbol} {r.timeframe}")
     L.append("")
@@ -175,7 +184,7 @@ def render_markdown(r: LayaReport) -> str:
 
     # choice 概率分布展开（方向 + 周期结构）
     for qid in ("方向", "周期结构", "突破质量"):
-        a = pred.get(qid)
+        a = _pred_get(pred, qid)
         if a and a.probabilities:
             L.append(f"**{qid} 概率分布**")
             L.append("")
@@ -256,6 +265,8 @@ _HTML_TMPL = """<!DOCTYPE html>
 
 {errors_html}
 
+{mt5_action_html}
+
 <h2>结论</h2>
 <div class="card">
   <div class="big">{direction_zh}</div>
@@ -313,12 +324,80 @@ def _plan_html(p: PricePlan) -> str:
     )
 
 
+def _mt5_action_card(r: LayaReport) -> str:
+    """根据报告方向生成 MT5 操作指引卡片。"""
+    pred = r.prediction
+    # 兼容 dict 和 dataclass/SimpleNamespace
+    if hasattr(pred, "get"):
+        dire = _pred_get(pred, "方向")
+    else:
+        dire = getattr(pred, "answers", {}).get("方向") if isinstance(getattr(pred, "answers", None), dict) else None
+    if not dire or not isinstance(getattr(dire, "value", None), str):
+        return ""
+
+    direction = str(dire.value).lower()
+    # 选可执行的那个计划
+    plan = None
+    if direction == "long" and r.long_plan.actionable:
+        plan = r.long_plan
+    elif direction == "short" and r.short_plan.actionable:
+        plan = r.short_plan
+    else:
+        # 两边都试试
+        for p in (r.long_plan, r.short_plan):
+            if p.actionable:
+                plan = p
+                direction = p.direction
+                break
+    if not plan:
+        return ""
+
+    side_en = "Buy" if direction == "long" else "Sell"
+    kind_map = {"limit": "Limit", "stop": "Stop"}
+    # 判断类型：如果 entry 接近支撑/阻力位，默认限价；否则突破
+    order_type = "Limit"  # 默认
+    entry_str = f"{plan.entry}" if plan.entry else "市价"
+
+    button_name = f"{side_en} {order_type}" if order_type != "Market" else side_en
+
+    card_class = "long" if direction == "long" else "short"
+    arrow = "↑" if direction == "long" else "↓"
+    zh_side = "买入" if direction == "long" else "卖出"
+
+    steps = [f"<b>在 MT5 中点「{button_name}」</b>"]
+    if order_type != "Market" and plan.entry:
+        steps.append(f"Price（价格）填 <b>{plan.entry}</b>")
+    steps.append(f"Volume（手数）建议 <b>1.00</b>（可在面板修改）")
+    if plan.stop:
+        steps.append(f"Stop Loss（止损）填 <b>{plan.stop}</b>")
+    if plan.target:
+        steps.append(f"Take Profit（止盈）填 <b>{plan.target}</b>")
+    steps.append("最后点「下订单」或按 Enter")
+
+    html_parts = [
+        f"<div class='card {card_class}' style='border-left: 4px solid {'#D62728' if direction == 'long' else '#1A9850'};'>",
+        f"<div style='font-size: 18px; font-weight: 700; margin-bottom: 8px;'>👉 MT5 操作指引：{zh_side}{arrow}</div>",
+        "<ol style='margin: 0; padding-left: 20px; line-height: 1.8;'>",
+    ]
+    for s in steps:
+        html_parts.append(f"<li>{s}</li>")
+    html_parts.append("</ol></div>")
+    return "".join(html_parts)
+
+
 def render_html(r: LayaReport) -> str:
     """HTML 报告。极简未来主义：#F5F5F7 底 / #1D1D1F 字 / #FF5C1A 强调。"""
     pred = r.prediction
-    dire = pred.get("方向")
-    struct = pred.get("周期结构")
-    sig = pred.get("信号有效")
+    # 兼容 dict / dataclass / SimpleNamespace
+    if hasattr(pred, "get"):
+        dire = _pred_get(pred, "方向")
+        struct = _pred_get(pred, "周期结构")
+        sig = _pred_get(pred, "信号有效")
+    else:
+        answers = getattr(pred, "answers", {})
+        dire = answers.get("方向") if isinstance(answers, dict) else None
+        struct = answers.get("周期结构") if isinstance(answers, dict) else None
+        sig = answers.get("信号有效") if isinstance(answers, dict) else None
 
     direction_zh = _DIRECTION_ZH.get(str(dire.value if dire else ""), "—")
     detail_rows = []
@@ -337,7 +416,7 @@ def render_html(r: LayaReport) -> str:
 
     prob_blocks = []
     for qid in ("方向", "周期结构", "突破质量"):
-        a = pred.get(qid)
+        a = _pred_get(pred, qid)
         if not (a and a.probabilities):
             continue
         items = []
@@ -364,6 +443,9 @@ def render_html(r: LayaReport) -> str:
     if r.errors:
         errors_html = "<div class='warn'>生成异常：" + html.escape("；".join(r.errors)) + "</div>"
 
+    # ── MT5 操作指引卡片（给新手看） ────────────────────────────────
+    mt5_action_html = _mt5_action_card(r)
+
     fmt = lambda v: "—" if v is None else str(v)  # noqa: E731
     return _HTML_TMPL.format(
         symbol=html.escape(r.symbol),
@@ -372,6 +454,7 @@ def render_html(r: LayaReport) -> str:
         device=html.escape(pred.device or "?"),
         latency_ms=pred.latency_ms,
         errors_html=errors_html,
+        mt5_action_html=mt5_action_html,
         direction_zh=direction_zh,
         direction_conf=(f"{dire.confidence * 100:.0f}%" if dire else "—"),
         struct_line=(
