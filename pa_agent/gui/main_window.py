@@ -1626,6 +1626,38 @@ class MainWindow(QMainWindow):
         self._set_chart_refresh_paused(False)
         self._start_refresh_loop()
 
+        # ── 后台预加载 Laya 权重（避免首次点报告时等十几秒） ────────────
+        self._preload_laya_weights()
+
+    def _preload_laya_weights(self) -> None:
+        """在数据源连上后后台加载 Laya 权重，首次点报告时零等待。"""
+        settings = getattr(self._ctx, "settings", None)
+        if settings is None:
+            return
+        laya_cfg = getattr(settings, "laya", None)
+        if laya_cfg is None or not bool(getattr(laya_cfg, "enabled", True)):
+            return
+        try:
+            from PyQt6.QtCore import QTimer
+            from pa_agent.ai.laya_engine import LayaEngine
+
+            def _do_preload():
+                try:
+                    engine = LayaEngine.get(
+                        model_dir=laya_cfg.model_dir,
+                        subfolder=laya_cfg.subfolder,
+                        device=getattr(laya_cfg, "device", "auto"),
+                    )
+                    engine.ensure_loaded()
+                    logger.info("✅ Laya 权重预加载完成（后续报告秒开）")
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Laya 预加载失败（不影响主流程）: %s", exc)
+
+            # 延迟 2 秒启动，避免和启动动画抢资源
+            QTimer.singleShot(2000, _do_preload)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Laya 预加载初始化失败: %s", exc)
+
     def _ensure_refresh_loop_running(self) -> None:
         """Start data fetch automatically if RefreshLoop is not already running.
 

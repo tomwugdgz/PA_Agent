@@ -76,11 +76,14 @@ class LayaReport:
 
 def _pred_get(pred, key, default=None):
     """兼容 dict / dataclass / SimpleNamespace 的 get 操作。"""
-    if hasattr(pred, "get"):
-        return _pred_get(pred, key, default)
-    answers = getattr(pred, "answers", {})
-    if isinstance(answers, dict):
-        return answers.get(key, default)
+    if hasattr(pred, "get") and not isinstance(pred, dict):
+        # dataclass/SimpleNamespace：从 answers 属性里取
+        answers = getattr(pred, "answers", {})
+        if isinstance(answers, dict):
+            return answers.get(key, default)
+        return default
+    elif isinstance(pred, dict):
+        return pred.get(key, default)
     return default
 
 def _plan_dict(p: PricePlan) -> dict[str, Any]:
