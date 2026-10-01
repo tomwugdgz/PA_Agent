@@ -209,7 +209,55 @@ def generate_report(frame: Any, settings: Any) -> LayaReport:
     _journal_report(report=report, frame=frame, cfg=cfg,
                     device=engine.device, latency_ms=latency_ms,
                     n_errors=len(errors))
+    # ── 最近一次报告落盘（供 MT5 面板「导入分析」读取；失败静默）
+    _persist_latest(report)
     return report
+
+
+def _persist_latest(report: LayaReport) -> None:
+    """把最近一次 Laya 报告的价格计划写到 logs/laya_latest.json。
+
+    MT5 面板与主窗口的分析是两条链路：面板只看得到 stage2_decision，
+    看不到 Laya 报告——此文件就是两者之间的桥。任何异常吞掉。
+    """
+    try:
+        import json as _json
+
+        from pa_agent.config.paths import LOGS_DIR
+
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        dire = report.prediction.answers.get("方向")
+        payload = {
+            "generated_at": report.generated_at,
+            "symbol": report.symbol,
+            "timeframe": report.timeframe,
+            "close": report.close,
+            "atr": report.atr,
+            "direction": (str(dire.value) if dire is not None else ""),
+            "direction_confidence": (round(dire.confidence, 3)
+                                     if dire is not None else None),
+            "long_plan": {
+                "actionable": report.long_plan.actionable,
+                "reason": report.long_plan.reason,
+                "entry": report.long_plan.entry,
+                "stop": report.long_plan.stop,
+                "target": report.long_plan.target,
+                "rr": report.long_plan.rr_ratio,
+            },
+            "short_plan": {
+                "actionable": report.short_plan.actionable,
+                "reason": report.short_plan.reason,
+                "entry": report.short_plan.entry,
+                "stop": report.short_plan.stop,
+                "target": report.short_plan.target,
+                "rr": report.short_plan.rr_ratio,
+            },
+        }
+        (LOGS_DIR / "laya_latest.json").write_text(
+            _json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("laya_latest.json 写入失败（不影响报告）: %s", exc)
 
 
 def _journal_report(

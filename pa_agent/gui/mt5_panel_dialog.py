@@ -11,11 +11,13 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from PyQt6.QtCore import QThread, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -161,8 +163,18 @@ class MT5PanelDialog(QDialog):
         v.addWidget(hint)
 
         row3 = QHBoxLayout()
-        self._fill_btn = QPushButton("按当前分析填入")
-        self._fill_btn.clicked.connect(self._fill_from_decision)
+        self._fill_btn = QPushButton("① 导入分析")
+        self._fill_btn.setToolTip(
+            "把主窗口分析结果填进下方参数：优先导入 AI 决策（两阶段分析），\n"
+            "没有可执行订单时自动导入最近一次 Laya 报告的价格计划。"
+        )
+        self._fill_btn.clicked.connect(self._import_analysis)
+        self._copy_btn = QPushButton("② 复制下单信息")
+        self._copy_btn.setToolTip(
+            "把当前下单参数格式化成文本复制到剪贴板，\n"
+            "可粘贴到聊天/备忘，或照着在 MT5 手动下单。"
+        )
+        self._copy_btn.clicked.connect(self._copy_order_info)
         self._connect_btn = QPushButton("连接 MT5")
         self._connect_btn.clicked.connect(self._on_connect)
         self._send_btn = QPushButton("确认后向 MT5 下单")
@@ -172,7 +184,7 @@ class MT5PanelDialog(QDialog):
             self._send_btn.setToolTip(
                 "已禁用：config/settings.json → mt5trading.enabled 设为 true 后可用"
             )
-        for b in (self._fill_btn, self._connect_btn, self._send_btn):
+        for b in (self._fill_btn, self._copy_btn, self._connect_btn, self._send_btn):
             row3.addWidget(b)
         row3.addStretch()
         v.addLayout(row3)
@@ -209,13 +221,35 @@ class MT5PanelDialog(QDialog):
         )
         self._decision_text.setHtml(html)
 
-    def _fill_from_decision(self) -> None:
-        """把当前 AI 决策填进下单参数（方向/类型/入场/止损/止盈），手数不动。"""
+    def _import_analysis(self) -> None:
+        """把主窗口分析结果填进下单参数。
+
+        来源优先级：
+        1. AI 决策（两阶段分析 stage2_decision）——有可执行订单时直接用；
+        2. 最近一次 Laya 报告（logs/laya_latest.json）——按报告方向取
+           对应价格计划，订单类型默认「限价单」（结构位挂单口径，可改）。
+        """
         d = self._decision()
-        if not d or str(d.get("order_type") or "") not in ("限价单", "突破单", "市价单"):
-            QMessageBox.information(
-                self, "按分析填入", "当前没有可执行的 AI 决策（no_order），请手动设置参数。")
+        if d and str(d.get("order_type") or "") in ("限价单", "突破单", "市价单"):
+            self._fill_from_decision_dict(d, source="AI 决策")
             return
+
+        latest = self._load_latest_laya()
+        if latest is not None:
+            plan, dire = self._pick_laya_plan(latest)
+            if plan is not None:
+                self._fill_from_laya_plan(latest, plan, dire)
+                return
+
+        QMessageBox.information(
+            self, "导入分析",
+            "没有可导入的分析结果：\n"
+            "· AI 决策为 no_order，且\n"
+            "· 本会话尚未生成 Laya 报告（或报告无可执行价格计划）。\n\n"
+            "请先在主窗口「提交分析」或生成「Laya 报告」，或手动设置参数。")
+
+    def _fill_from_decision_dict(self, d: dict[str, Any], *, source: str) -> None:
+        """AI 决策 → 表单（手数不动）。"""
 
         def _f(v: Any) -> float:
             try:
@@ -223,13 +257,90 @@ class MT5PanelDialog(QDialog):
             except (TypeError, ValueError):
                 return 0.0
 
-        self._cb_dir.setCurrentIndex(0 if str(d.get("order_direction") or "").lower() == "long" else 1)
+        self._cb_dir.setCurrentIndex(
+            0 if str(d.get("order_direction") or "").lower() == "long" else 1)
         kind_map = {"市价单": 0, "限价单": 1, "突破单": 2}
         self._cb_kind.setCurrentIndex(kind_map.get(str(d.get("order_type") or ""), 0))
         self._t_entry.setValue(_f(d.get("entry_price")))
         self._t_stop.setValue(_f(d.get("stop_loss_price")))
         self._t_tp.setValue(_f(d.get("take_profit_price")))
-        self._status.setText("已按当前 AI 分析填入下单参数（可手改）")
+        self._status.setText(f"已导入{source}（可手改）")
+
+    def _load_latest_laya(self) -> dict[str, Any] | None:
+        """读取最近一次 Laya 报告（logs/laya_latest.json）。失败返回 None。"""
+        try:
+            import json as _json
+
+            from pa_agent.config.paths import LOGS_DIR
+
+            path = LOGS_DIR / "laya_latest.json"
+            if not path.is_file():
+                return None
+            return _json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _pick_laya_plan(
+        self, latest: dict[str, Any]
+    ) -> tuple[dict[str, Any] | None, str]:
+        """按报告方向选对应价格计划；方向缺失时选可执行的那个。
+
+        返回 (plan 字典, 方向 "long"/"short")；无可用计划返回 (None, "")。
+        """
+        dire = str(latest.get("direction") or "").lower()
+        plans = {"long": latest.get("long_plan") or {},
+                 "short": latest.get("short_plan") or {}}
+        if dire in plans and plans[dire].get("actionable"):
+            return plans[dire], dire
+        for key in ("long", "short"):
+            if plans[key].get("actionable"):
+                return plans[key], key
+        return None, ""
+
+    def _fill_from_laya_plan(
+        self, latest: dict[str, Any], plan: dict[str, Any], dire: str
+    ) -> None:
+        """Laya 价格计划 → 表单。类型默认限价单（结构位挂单口径）。"""
+
+        def _f(v: Any) -> float:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return 0.0
+
+        self._cb_dir.setCurrentIndex(0 if dire == "long" else 1)
+        self._cb_kind.setCurrentIndex(1)  # 限价单：结构位挂单，可改
+        self._t_entry.setValue(_f(plan.get("entry")))
+        self._t_stop.setValue(_f(plan.get("stop")))
+        self._t_tp.setValue(_f(plan.get("target")))
+        conf = latest.get("direction_confidence")
+        conf_txt = f"，方向置信度 {conf:.0%}" if isinstance(conf, (int, float)) else ""
+        self._status.setText(
+            f"已导入 Laya 报告价格计划（{latest.get('generated_at', '')}{conf_txt}，"
+            "类型默认限价单，可改）")
+
+    def _copy_order_info(self) -> None:
+        """把当前下单参数格式化成文本复制到剪贴板。"""
+        meta = getattr(self._record, "meta", None)
+        symbol = str(getattr(meta, "symbol", "") or "未知品种")
+        timeframe = str(getattr(meta, "timeframe", "") or "")
+        direction = self._cb_dir.currentText()
+        kind = self._cb_kind.currentText()
+        entry = self._t_entry.value()
+        stop = self._t_stop.value()
+        tp = self._t_tp.value()
+        lot = self._t_lot.value()
+        lines = [
+            f"PA_Agent 下单信息（{time.strftime('%Y-%m-%d %H:%M')}）",
+            f"品种：{symbol} {timeframe}",
+            f"方向：{direction}　类型：{kind}",
+            f"入场：{entry if entry > 0 else '市价'}",
+            f"止损：{stop if stop > 0 else '未设'}",
+            f"止盈：{tp if tp > 0 else '未设'}",
+            f"手数：{lot}",
+        ]
+        QApplication.clipboard().setText("\n".join(lines))
+        self._status.setText("下单信息已复制到剪贴板，可直接粘贴或照着在 MT5 手动下单")
 
     def _on_connect(self) -> None:
         try:
