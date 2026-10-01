@@ -131,6 +131,8 @@ LayaReport
 
 ## 六、微调数据闭环（让置信度可用）
 
+### 自动收集（零成本）
+
 每次推理自动落一份标注（`laya.collect_annotations: true`）：
 
 ```
@@ -138,10 +140,39 @@ experience/laya_annotations/YYYY-MM.jsonl
   每行 = {ts_ms, state, questions, answers, context, label: null}
 ```
 
-人工把 `label` 补上（`pa_agent.ai.laya_annotation.relabel_line(path, line_no, label)`），
-攒到 **≥500 条**即可对 Laya 做微调——微调后结构题/方向题的置信度才有实战价值。
-经验库（`experience_writer.py`）会同时用后续行情自动裁决每笔建议的盈亏，
-success/failure 案例会注入后续分析提示词。
+### 半自动标注（GUI）
+
+Laya 报告窗口点击「进入标注模式」→ 为每个问题选择你认为正确的答案 → 「保存标注」。
+标签自动回填到 JSONL 的 `label` 字段。
+
+### 一键微调脚本
+
+```bash
+# 先装依赖
+pip install transformers peft accelerate datasets
+
+# 干跑：只统计样本数
+python tools/finetune_laya.py --dry-run
+
+# 真正训练（至少 500 条已标注样本）
+python tools/finetune_laya.py --epochs 3 --lr 2e-5 --batch-size 4
+
+# 输出权重到 ~/laya-models/laya-finetuned/
+# 在 config/settings.json 中把 laya.model_dir 指向该目录即可启用新模型
+```
+
+### 经验库自动裁决
+
+`experience_writer.py` 会同时用后续行情自动裁决每笔建议的盈亏，
+success/failure 案例会注入后续分析提示词，形成**无需人工干预的弱监督信号**。
+
+当积累了足够多自动裁决的样本后，可批量回填 label：
+
+```python
+from pa_agent.ai.laya_annotation import relabel_line
+relabel_line(Path("experience/laya_annotations/2026-10.jsonl"), line_no=42,
+             label={"方向": "long", "结构": "trending_tr"})
+```
 
 ## 七、运行记录（审计）
 

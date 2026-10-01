@@ -18,6 +18,7 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QDesktopServices, QFont
 from PyQt6.QtCore import QUrl
 from PyQt6.QtWidgets import (
+    QComboBox,
     QDialog,
     QHBoxLayout,
     QLabel,
@@ -25,6 +26,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QTextBrowser,
     QVBoxLayout,
+    QWidget,
 )
 
 from pa_agent.report.laya_pipeline import generate_report
@@ -89,11 +91,18 @@ class LayaReportDialog(QDialog):
             "重新拉取主窗口当前图表的最新收盘 K 线并重新推理——\n"
             "每次刷新都用此刻的数据，不会复用旧报告。")
         self._refresh_btn.clicked.connect(self._refresh_with_latest)
+        self._label_mode_btn = QPushButton("进入标注模式")
+        self._label_mode_btn.setCheckable(True)
+        self._label_mode_btn.setToolTip(
+            "开启后可为 Laya 的每个问题答案打标签（多/空/观望等），\n"
+            "用于后续微调训练；标签自动存入 experience/laya_annotations/")
+        self._label_mode_btn.clicked.connect(self._toggle_label_mode)
         self._export_md_btn = QPushButton("导出 Markdown")
         self._export_html_btn = QPushButton("导出 HTML")
         self._open_dir_btn = QPushButton("打开报告目录")
         self._refresh_btn.setEnabled(self._frame_provider is not None)
         btn_row.addWidget(self._refresh_btn)
+        btn_row.addWidget(self._label_mode_btn)
         for b in (self._export_md_btn, self._export_html_btn, self._open_dir_btn):
             b.setEnabled(False)
             btn_row.addWidget(b)
@@ -102,6 +111,11 @@ class LayaReportDialog(QDialog):
         close_btn.clicked.connect(self.reject)
         btn_row.addWidget(close_btn)
         root.addLayout(btn_row)
+
+        # 标注面板（默认隐藏，开启标注模式后显示在报告下方）
+        self._label_panel = self._build_label_panel()
+        self._label_panel.setVisible(False)
+        root.addWidget(self._label_panel)
 
         self._export_md_btn.clicked.connect(self._export_md)
         self._export_html_btn.clicked.connect(self._export_html)
@@ -203,3 +217,96 @@ class LayaReportDialog(QDialog):
         if w is not None and w.isRunning():
             w.wait(1500)  # 推理是纯计算，1.5s 内不响应就随它去（守护线程由 Qt 回收）
         super().closeEvent(event)
+
+    # ── 标注模式 ─────────────────────────────────────────────────────────────
+
+    def _build_label_panel(self) -> QWidget:
+        """构建标注面板：为 Laya 的每个问题提供下拉选择标签。"""
+        panel = QWidget()
+        v = QVBoxLayout(panel)
+        v.setContentsMargins(4, 4, 4, 4)
+        hint = QLabel("标注说明：为每个问题选择你认为正确的答案，用于后续微调训练。")
+        hint.setObjectName("mutedLabel")
+        hint.setWordWrap(True)
+        v.addWidget(hint)
+        self._label_widgets: dict[str, QComboBox] = {}
+        self._label_submit_btn = QPushButton("保存标注")
+        self._label_submit_btn.clicked.connect(self._save_labels)
+        v.addWidget(self._label_submit_btn)
+        return panel
+
+    def _toggle_label_mode(self, checked: bool) -> None:
+        """切换标注模式显示/隐藏。"""
+        self._label_panel.setVisible(checked)
+        if checked and self._report is not None:
+            self._populate_label_widgets()
+        self._label_mode_btn.setText("退出标注模式" if checked else "进入标注模式")
+
+    def _populate_label_widgets(self) -> None:
+        """根据当前报告的 questions 填充标注下拉框。"""
+        # 清空旧控件
+        for i in reversed(range(self._label_panel.layout().count() - 1)):
+            item = self._label_panel.layout().itemAt(i + 1)  # 跳过 hint
+            if item and item.widget():
+                item.widget().deleteLater()
+        self._label_widgets.clear()
+
+        from pa_agent.ai.laya_schema import build_questions
+
+        questions = build_questions()
+        answers = self._report.prediction.answers if self._report else {}
+
+        for qid, qspec in questions.items():
+            row = QHBoxLayout()
+            label = QLabel(qspec["question"][:30])  # 截断长问题
+            label.setToolTip(qspec["question"])
+            combo = QComboBox()
+            options = qspec.get("options", [])
+            if qspec["type"] == "noul":
+                options = ["有效", "无效"]
+            elif qspec["type"] == "score":
+                options = [f"{i}" for i in range(11)]
+            combo.addItems(options)
+            # 默认选中 Laya 给出的答案
+            ans = answers.get(qid)
+            if ans is not None:
+                val = str(ans.value) if hasattr(ans, "value") else str(ans)
+                idx = combo.findText(val)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+            row.addWidget(label)
+            row.addWidget(combo, 1)
+            self._label_widgets[qid] = combo
+            self._label_panel.layout().addLayout(row)
+
+    def _save_labels(self) -> None:
+        """把用户标注写入 JSONL 文件。"""
+        if not self._report:
+            return
+        from pa_agent.ai.laya_annotation import append_sample
+        from pa_agent.ai.laya_schema import build_questions
+
+        questions = build_questions()
+        labels: dict[str, str] = {}
+        for qid, combo in self._label_widgets.items():
+            labels[qid] = combo.currentText()
+
+        try:
+            append_sample(
+                state=self._report.state_text,
+                questions=questions,
+                answers={
+                    qid: {"kind": a.kind, "value": a.value, "confidence": a.confidence}
+                    for qid, a in self._report.prediction.answers.items()
+                },
+                context={
+                    "symbol": self._report.symbol,
+                    "timeframe": self._report.timeframe,
+                    "close": self._report.close,
+                    "atr": self._report.atr,
+                },
+                labels=labels,  # 新增字段
+            )
+            QMessageBox.information(self, "标注已保存", "标签已存入 experience/laya_annotations/")
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "保存失败", str(exc))

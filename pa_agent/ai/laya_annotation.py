@@ -44,9 +44,14 @@ def append_sample(
     questions: dict[str, dict[str, Any]],
     answers: dict[str, Any],
     context: dict[str, Any],
+    labels: dict[str, str] | None = None,
     experience_dir: Path | None = None,
 ) -> Path | None:
-    """把一次 Laya 推理的三元组追加到当月 JSONL。返回文件路径；失败仅记日志。"""
+    """把一次 Laya 推理的三元组追加到当月 JSONL。返回文件路径；失败仅记日志。
+
+    Args:
+        labels: 人工标注的正确标签（qid → 正确选项）；None = 自动收集未标注样本。
+    """
     try:
         out_dir = annotations_dir(experience_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -55,11 +60,11 @@ def append_sample(
 
         sample = {
             "ts_ms": int(time.time() * 1000),
-            "source": "auto",
-            "label": None,          # 人工/回测补齐后回填
+            "source": "manual_label" if labels else "auto",
+            "label": labels,          # 人工/回测补齐后回填
             "state": state,
             "questions": questions,
-            "answers": answers,     # 模型实际输出（注意：不是正确答案）
+            "answers": answers,       # 模型实际输出（注意：不是正确答案）
             "context": context,
         }
         with path.open("a", encoding="utf-8") as f:
