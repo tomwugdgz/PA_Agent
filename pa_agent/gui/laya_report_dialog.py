@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QDesktopServices, QFont
 from PyQt6.QtCore import QUrl
 from PyQt6.QtWidgets import (
@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QTextBrowser,
     QVBoxLayout,
@@ -77,6 +78,19 @@ class LayaReportDialog(QDialog):
         self._status.setObjectName("mutedLabel")
         self._status.setWordWrap(True)
         root.addWidget(self._status)
+
+        # 进度条（模拟加载进度，给用户视觉反馈）
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
+        self._progress.setTextVisible(True)
+        self._progress.setFormat("加载中... %p%")
+        root.addWidget(self._progress)
+
+        # 定时器模拟进度更新（实际加载是阻塞的，这里给个心理安慰）
+        self._progress_timer = QTimer(self)
+        self._progress_timer.timeout.connect(self._update_progress_simulated)
+        self._progress_timer.start(500)  # 每 0.5 秒更新一次
 
         self._view = QTextBrowser()
         self._view.setOpenExternalLinks(True)
@@ -148,22 +162,33 @@ class LayaReportDialog(QDialog):
         self._start()
 
     def _on_ready(self, report: Any) -> None:
+        self._progress_timer.stop()
+        self._progress.setVisible(False)
         self._report = report
         self._last_html = render_html(report)
         self._view.setHtml(self._last_html)
-        newest_ts = getattr(getattr(report, "bars_meta", None), "newest_ts", None)
+        device_name = report.prediction.device or "?"
+        load_s = report.prediction.load_ms / 1000
+        infer_ms = report.prediction.latency_ms
         self._status.setText(
-            f"{report.symbol} {report.timeframe} · 设备 {report.prediction.device or '?'}"
-            f" · 推理 {report.prediction.latency_ms:.0f}ms"
-            f"（权重加载 {report.prediction.load_ms / 1000:.1f}s）"
-            f" · 报告时间 {report.generated_at}"
+            f"{report.symbol} {report.timeframe} · 设备 {device_name}"
+            f" · 推理 {infer_ms:.0f}ms（权重加载 {load_s:.1f}s）"
         )
-        for b in (self._refresh_btn, self._export_md_btn, self._export_html_btn,
-                  self._open_dir_btn):
+        for b in (self._refresh_btn, self._export_md_btn, self._export_html_btn, self._open_dir_btn):
             b.setEnabled(True)
         self._worker = None
 
+    def _update_progress_simulated(self) -> None:
+        """模拟进度条增长（实际加载是阻塞的，这里给用户视觉反馈）。"""
+        cur = self._progress.value()
+        if cur < 90:
+            # 前 90% 快速爬升，最后 10% 等真实结果
+            self._progress.setValue(cur + 5)
+        self._status.setText(f"正在加载 Laya 权重并推理…（已等待 {cur}%）")
+
     def _on_failed(self, msg: str) -> None:
+        self._progress_timer.stop()
+        self._progress.setVisible(False)
         self._status.setText("生成失败")
         self._view.setHtml(
             "<div style='color:#B91C1C;font-size:15px;padding:12px;'>"
