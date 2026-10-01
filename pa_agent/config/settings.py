@@ -1,5 +1,7 @@
 """Pydantic settings models for PA Agent."""
 from __future__ import annotations
+
+from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -168,7 +170,9 @@ class LayaSettings(BaseModel):
     #: 总开关。关闭时工具栏「Laya 报告」按钮置灰。
     enabled: bool = True
     #: 权重根目录（内含 multilingual/ 子目录）。Agent 检测到本地目录存在即跳过联网下载。
-    model_dir: str = r"C:\Users\wolf2\laya-models\laya"
+    #: 默认放在当前用户主目录 ~/laya-models/laya（Windows 即
+    #: C:\Users\<用户名>\laya-models\laya），可在 config/settings.json 覆盖。
+    model_dir: str = str(Path.home() / "laya-models" / "laya")
     #: 权重子目录：multilingual 支持中文（含 CJK 路由），"" 为英文档
     subfolder: str = "multilingual"
     #: 推理设备：auto=有 CUDA 就用 GPU，否则 CPU

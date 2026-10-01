@@ -1692,7 +1692,30 @@ class MainWindow(QMainWindow):
             )
             return
         try:
-            dlg = LayaReportDialog(frame, settings, parent=self)
+            def _laya_frame_provider():
+                """每次取报告都用最新数据：优先用 1 秒级刷新循环里的
+                最新收盘 K 线重建帧（含 EMA/ATR 指标），失败才退回
+                上次分析时的旧帧。"""
+                bars = getattr(self, "_last_frame_ready_bars", None) or []
+                if bars:
+                    try:
+                        from pa_agent.data.snapshot import build_analysis_frame
+
+                        frame = build_analysis_frame(
+                            list(bars),
+                            self._analysis_bar_count(),
+                            self._symbol_combo.currentText().strip(),
+                            self._tf_combo.currentText(),
+                            now_ms=self._reference_now_ms(),
+                        )
+                        if frame is not None and getattr(frame, "bars", None):
+                            return frame
+                    except Exception:  # noqa: BLE001
+                        logger.debug("Laya 最新帧重建失败，退回旧帧", exc_info=True)
+                return frame
+
+            dlg = LayaReportDialog(_laya_frame_provider(), settings, parent=self,
+                                   frame_provider=_laya_frame_provider)
             dlg.exec()
         except Exception as exc:  # noqa: BLE001
             logger.warning("Laya report dialog failed: %s", exc)

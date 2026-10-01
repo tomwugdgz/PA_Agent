@@ -56,12 +56,15 @@ class LayaReportWorker(QThread):
 class LayaReportDialog(QDialog):
     """Laya 报告窗口（模态）。同一时刻只允许一个 worker 在跑。"""
 
-    def __init__(self, frame: Any, settings: Any, parent: Any = None) -> None:
+    def __init__(self, frame: Any, settings: Any, parent: Any = None,
+                 frame_provider: Any = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Laya 市场分析报告")
         self.resize(920, 760)
         self._frame = frame
         self._settings = settings
+        #: 返回最新 KlineFrame 的回调（主窗口提供）；None = 用静态帧
+        self._frame_provider = frame_provider
         self._worker: LayaReportWorker | None = None
         self._report: Any = None
         self._last_html = ""
@@ -81,9 +84,16 @@ class LayaReportDialog(QDialog):
         root.addWidget(self._view, 1)
 
         btn_row = QHBoxLayout()
+        self._refresh_btn = QPushButton("刷新（最新数据）")
+        self._refresh_btn.setToolTip(
+            "重新拉取主窗口当前图表的最新收盘 K 线并重新推理——\n"
+            "每次刷新都用此刻的数据，不会复用旧报告。")
+        self._refresh_btn.clicked.connect(self._refresh_with_latest)
         self._export_md_btn = QPushButton("导出 Markdown")
         self._export_html_btn = QPushButton("导出 HTML")
         self._open_dir_btn = QPushButton("打开报告目录")
+        self._refresh_btn.setEnabled(self._frame_provider is not None)
+        btn_row.addWidget(self._refresh_btn)
         for b in (self._export_md_btn, self._export_html_btn, self._open_dir_btn):
             b.setEnabled(False)
             btn_row.addWidget(b)
@@ -105,18 +115,37 @@ class LayaReportDialog(QDialog):
         self._worker = LayaReportWorker(self._frame, self._settings, parent=self)
         self._worker.ready.connect(self._on_ready)
         self._worker.failed.connect(self._on_failed)
+        self._refresh_btn.setEnabled(False)
         self._worker.start()
+
+    def _refresh_with_latest(self) -> None:
+        """用主窗口当前最新数据重建帧并重新推理。"""
+        if self._worker is not None and self._worker.isRunning():
+            return
+        if self._frame_provider is not None:
+            try:
+                fresh = self._frame_provider()
+            except Exception as exc:  # noqa: BLE001
+                fresh = None
+                logger.debug("frame_provider 失败: %s", exc)
+            if fresh is not None and getattr(fresh, "bars", None):
+                self._frame = fresh
+        self._status.setText("正在用最新数据重新推理…")
+        self._start()
 
     def _on_ready(self, report: Any) -> None:
         self._report = report
         self._last_html = render_html(report)
         self._view.setHtml(self._last_html)
+        newest_ts = getattr(getattr(report, "bars_meta", None), "newest_ts", None)
         self._status.setText(
             f"{report.symbol} {report.timeframe} · 设备 {report.prediction.device or '?'}"
             f" · 推理 {report.prediction.latency_ms:.0f}ms"
             f"（权重加载 {report.prediction.load_ms / 1000:.1f}s）"
+            f" · 报告时间 {report.generated_at}"
         )
-        for b in (self._export_md_btn, self._export_html_btn, self._open_dir_btn):
+        for b in (self._refresh_btn, self._export_md_btn, self._export_html_btn,
+                  self._open_dir_btn):
             b.setEnabled(True)
         self._worker = None
 

@@ -22,13 +22,13 @@
 ## 三、首次使用前的准备（已由 AI 完成）
 
 - ✅ Python 3.12 装 `laya 0.3.22` + `torch`（当前 CPU 版；CUDA 版安装中，装完自动生效）
-- ✅ 权重下载到 `C:\Users\wolf2\laya-models\laya\multilingual\`（615 MB，脚本 `tools/download_laya.py`）
+- ✅ 权重下载到 `%USERPROFILE%\laya-models\laya\multilingual\`（615 MB，脚本 `tools/download_laya.py`）
 - ✅ `config/settings.json` 写入 `laya` 配置段
 
 若换机器重装，只需：
 
 ```bat
-"C:\Users\wolf2\AppData\Local\Programs\Python\Python312\python.exe" tools\download_laya.py
+python tools\download_laya.py
 ```
 
 ## 四、配置项（config/settings.json → laya）
@@ -36,7 +36,7 @@
 | 键 | 默认 | 说明 |
 |---|---|---|
 | enabled | true | 关闭后按钮提示已禁用 |
-| model_dir | C:\Users\wolf2\laya-models\laya | 权重根目录 |
+| model_dir | %USERPROFILE%\laya-models\laya | 权重根目录 |
 | subfolder | multilingual | 中文档（"" 为英文档） |
 | device | auto | auto=有 CUDA 用 GPU，否则 CPU |
 | min_confidence | 0.35 | 低于此置信度标 ⚠️，相关价格仅供参考 |

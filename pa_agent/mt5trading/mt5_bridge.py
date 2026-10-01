@@ -293,13 +293,67 @@ def _send_order_impl(req: OrderRequest, *, cfg: Any) -> OrderResult:
         if price is None or price <= 0:
             return OrderResult(False, None, None, "挂单缺少有效入场价")
 
+        # ── 价格对齐品种规格 + 挂单方向/距离校验（服务器 10015 Invalid
+        #    price 的提前拦截：价格未按 point 取整、限价/突破单挂错边、
+        #    SL/TP 距离小于 stops_level 都会在服务器被拒） ──────────────
+        def _norm(v: float) -> float:
+            if sym.point > 0:
+                return round(round(v / sym.point) * sym.point, sym.digits)
+            return round(v, sym.digits)
+
+        price = _norm(price)
+        stop_loss = _norm(float(req.stop_loss))
+        take_profit = _norm(float(req.take_profit)) if req.take_profit else None
+        stops_dist = sym.stops_level_points * sym.point
+
+        def _too_far_from_market(p: float) -> bool:
+            return stops_dist > 0 and abs(p - ref_price) < stops_dist
+
+        if req.order_kind == "limit":
+            if req.direction == "long" and not (price < ref_price):
+                return OrderResult(
+                    False, None, None,
+                    f"限价买入挂单价 {price} 必须低于当前卖价 {ref_price}"
+                    f"（回踩做多挂低价；想突破追多请用「突破单」）")
+            if req.direction == "short" and not (price > ref_price):
+                return OrderResult(
+                    False, None, None,
+                    f"限价卖出挂单价 {price} 必须高于当前买价 {ref_price}"
+                    f"（反抽做空挂高价；想跌破追空请用「突破单」）")
+        if req.order_kind == "stop":
+            min_dist = max(stops_dist, sym.point)
+            if req.direction == "long" and not (price >= ref_price + min_dist):
+                return OrderResult(
+                    False, None, None,
+                    f"突破买入触发价 {price} 必须高于当前卖价 {ref_price}"
+                    f"至少 {min_dist:g}（当前价上方追多）")
+            if req.direction == "short" and not (price <= ref_price - min_dist):
+                return OrderResult(
+                    False, None, None,
+                    f"突破卖出触发价 {price} 必须低于当前买价 {ref_price}"
+                    f"至少 {min_dist:g}（当前价下方追空）")
+        if stops_dist > 0:
+            if abs(price - stop_loss) < stops_dist:
+                return OrderResult(
+                    False, None, None,
+                    f"止损 {stop_loss} 距入场 {price} 不足 "
+                    f"{sym.stops_level_points} point（该品种最小距离），"
+                    "请把止损放远或换波动更大的周期")
+            if take_profit and abs(take_profit - price) < stops_dist:
+                return OrderResult(
+                    False, None, None,
+                    f"止盈 {take_profit} 距入场 {price} 不足 "
+                    f"{sym.stops_level_points} point（该品种最小距离）")
+
         # ── 止损方向校验（交易所层面止盈同向）
         if req.stop_loss is None or req.stop_loss <= 0:
             return OrderResult(False, None, None, "缺少止损价")
-        if req.direction == "long" and not (req.stop_loss < price):
-            return OrderResult(False, None, None, f"多头止损 {req.stop_loss} 必须低于入场 {price}")
-        if req.direction == "short" and not (req.stop_loss > price):
-            return OrderResult(False, None, None, f"空头止损 {req.stop_loss} 必须高于入场 {price}")
+        if req.direction == "long" and not (stop_loss < price):
+            return OrderResult(False, None, None,
+                               f"多头止损 {stop_loss} 必须低于入场 {price}")
+        if req.direction == "short" and not (stop_loss > price):
+            return OrderResult(False, None, None,
+                               f"空头止损 {stop_loss} 必须高于入场 {price}")
 
         base: dict[str, Any] = {
             "action": (mt5.TRADE_ACTION_DEAL if req.order_kind == "market"
@@ -308,14 +362,14 @@ def _send_order_impl(req: OrderRequest, *, cfg: Any) -> OrderResult:
             "volume": lot,
             "type": otype,
             "price": price,
-            "sl": float(req.stop_loss),
+            "sl": stop_loss,
             "deviation": 20,
             "magic": int(cfg.magic),
             "comment": req.comment[:31],   # MT5 注释上限 31 字符
             "type_time": mt5.ORDER_TIME_GTC,
         }
-        if req.take_profit:
-            base["tp"] = float(req.take_profit)
+        if take_profit:
+            base["tp"] = take_profit
 
         last_code, last_msg = None, ""
         for filling in _FILLING_CANDIDATES:
@@ -330,8 +384,8 @@ def _send_order_impl(req: OrderRequest, *, cfg: Any) -> OrderResult:
                 return OrderResult(
                     True, last_code, int(getattr(result, "order", 0) or 0),
                     f"{req.order_kind} 单{verb}：{req.symbol} {req.direction} "
-                    f"{lot} 手 @ {price}，SL {req.stop_loss}"
-                    + (f"，TP {req.take_profit}" if req.take_profit else "")
+                    f"{lot} 手 @ {price}，SL {stop_loss}"
+                    + (f"，TP {take_profit}" if take_profit else "")
                     + f"（{_filling_name(filling)}，票号 #{result.order}）",
                 )
             last_msg = str(getattr(result, "comment", "") or result.retcode)

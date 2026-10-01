@@ -2,7 +2,7 @@
 """Laya 可行性冒烟测试（本地离线权重版）。
 
 前置：先跑 `python tools/download_laya.py` 把 multilingual 权重拉到
-      C:\\Users\\wolf2\\laya-models\\laya\\multilingual\\
+      ~/laya-models/laya/multilingual/（Windows 即 %USERPROFILE% 下同名目录）
 
 验证三件事：
   1. 本地目录能否被 laya.load 接受（不走联网）
@@ -25,7 +25,7 @@ os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 import laya  # noqa: E402
 
-MODEL_DIR = r"C:\Users\wolf2\laya-models\laya"
+MODEL_DIR = os.path.expanduser("~/laya-models/laya")
 SUBFOLDER = "multilingual"
 
 # PA_Agent 的 8 类周期位置（cycle_enums.CYCLE_ORDER），正好 <20 选项

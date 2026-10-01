@@ -35,6 +35,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 # ---------------------------------------------------------------- 配置
 
@@ -78,7 +79,7 @@ EXPECT_SIZE = {
     "multilingual/encoder/config.json": 1_938,
 }
 
-DEST_ROOT = r"C:\Users\wolf2\laya-models\laya"
+DEST_ROOT = str(Path.home() / "laya-models" / "laya")
 CHUNK = 1 << 20  # 1 MiB
 
 
