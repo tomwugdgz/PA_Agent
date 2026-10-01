@@ -88,21 +88,45 @@ def connect(terminal_path: str = "") -> AccountInfo:
         raise MT5BridgeError(reason)
     import MetaTrader5 as mt5
 
+    _reinitialize(terminal_path)
+    acc = mt5.account_info()
+    if acc is None:
+        mt5.shutdown()
+        raise MT5BridgeError(f"MT5 已连接但未登录账户（{_fmt_err()}）。")
+    return AccountInfo(
+        login=int(acc.login),
+        server=str(acc.server),
+        currency=str(acc.currency),
+        balance=float(acc.balance),
+        equity=float(acc.equity),
+        leverage=int(acc.leverage),
+    )
+
+
+def _reinitialize(terminal_path: str = "") -> None:
+    """（重）建立终端连接：shutdown 后 initialize。失败抛 MT5BridgeError。"""
+    import MetaTrader5 as mt5
+
     kwargs: dict[str, Any] = {}
     if terminal_path.strip():
         kwargs["path"] = terminal_path.strip()
     if not mt5.initialize(**kwargs):
         raise MT5BridgeError(f"无法连接 MT5 终端（{_fmt_err()}）。请先启动并登录 MT5。")
-    # 句柄活性检查：initialize 可能因残留旧句柄返回 True 但连接已死
-    # （表现为后续 symbol_info_tick 报 -4: Terminal: Not found）。
-    # terminal_info() 为 None 即判定失效 → shutdown 重连一次。
+
+
+def _ensure_alive(terminal_path: str = "") -> None:
+    """验活 + 自愈：terminal_info() 为 None（连接已死）或后续 IPC 调用
+    报瞬时 -1/-4 时，shutdown 重连一次。
+
+    背景（实测）：残留旧句柄时 initialize() 仍返回 True 但连接已死
+    （后续调用报 -4: Terminal: Not found）；-1: Terminal: Call failed
+    为瞬时 IPC 故障（多进程同时连同一终端时出现），重试即恢复。
+    """
+    import MetaTrader5 as mt5
+
     if mt5.terminal_info() is None:
         mt5.shutdown()
-        if not mt5.initialize(**kwargs):
-            raise MT5BridgeError(
-                f"MT5 终端连接已失效且重连失败（{_fmt_err()}）。"
-                "请确认终端在运行且已登录，再点「连接 MT5」。"
-            )
+        _reinitialize(terminal_path)
     acc = mt5.account_info()
     if acc is None:
         mt5.shutdown()
@@ -127,24 +151,42 @@ def shutdown() -> None:
         pass
 
 
-def get_symbol_info(symbol: str) -> SymbolInfo:
-    """读取品种规格。自动 select 以确保可见。"""
+def get_symbol_info(symbol: str, terminal_path: str = "") -> SymbolInfo:
+    """读取品种规格。自动 select 以确保可见；瞬时 IPC 故障自动重连重试。
+
+    -1: Terminal: Call failed 等瞬时错误在多进程连同一终端时偶发，
+    重试即恢复——每次重试前先验活重连（_ensure_alive）。
+    """
+    import time as _time
+
     import MetaTrader5 as mt5
 
-    if not mt5.symbol_select(symbol, False):
-        raise MT5BridgeError(f"品种 {symbol} 在 MT5 中不可见（{_fmt_err()}）。")
-    info = mt5.symbol_info(symbol)
-    if info is None:
-        raise MT5BridgeError(f"无法读取品种信息 {symbol}（{_fmt_err()}）。")
-    return SymbolInfo(
-        name=str(info.name),
-        digits=int(info.digits),
-        point=float(info.point),
-        spread_points=int(getattr(info, "spread", 0)),
-        volume_min=float(info.volume_min),
-        volume_max=float(info.volume_max),
-        volume_step=float(info.volume_step),
-        stops_level_points=int(getattr(info, "trade_stops_level", 0)),
+    last_err = "未知错误"
+    for attempt in range(3):
+        _ensure_alive(terminal_path)
+        # visible=True：把品种加入「市场报价」。实测 MetaQuotes-Demo 对
+        # 不在市场报价里的品种 select(visible=False) 会失败并误报
+        # -1: Terminal: Call failed；visible=True 恒成功且无副作用。
+        if mt5.symbol_select(symbol, True):
+            info = mt5.symbol_info(symbol)
+            if info is not None:
+                return SymbolInfo(
+                    name=str(info.name),
+                    digits=int(info.digits),
+                    point=float(info.point),
+                    spread_points=int(getattr(info, "spread", 0)),
+                    volume_min=float(info.volume_min),
+                    volume_max=float(info.volume_max),
+                    volume_step=float(info.volume_step),
+                    stops_level_points=int(getattr(info, "trade_stops_level", 0)),
+                )
+        last_err = _fmt_err()
+        if attempt < 2:
+            _time.sleep(0.5)
+    raise MT5BridgeError(
+        f"品种 {symbol} 在 MT5 中不可见（{last_err}）。"
+        "请确认：① 终端在运行且已登录；② MT5「市场报价」窗口里能搜到"
+        f" {symbol}（品种名可与图表数据源不同，可在下单页修改品种）。"
     )
 
 
@@ -194,7 +236,7 @@ def _send_order_impl(req: OrderRequest, *, cfg: Any) -> OrderResult:
 
     connect(cfg.terminal_path)  # 幂等：已连接时无副作用
     try:
-        sym = get_symbol_info(req.symbol)
+        sym = get_symbol_info(req.symbol, getattr(cfg, "terminal_path", "") or "")
 
         if cfg.max_spread_points and sym.spread_points > cfg.max_spread_points:
             return OrderResult(
@@ -205,8 +247,9 @@ def _send_order_impl(req: OrderRequest, *, cfg: Any) -> OrderResult:
         lot = normalize_lot(req.lot, sym)
         tick = mt5.symbol_info_tick(req.symbol)
         if tick is None:
-            # 第一次失败先强制加入「市场报价」再取一次（部分品种未激活行情时为 None）
+            # 第一次失败：验活重连 + 强制加入「市场报价」后再取一次
             try:
+                _ensure_alive(getattr(cfg, "terminal_path", "") or "")
                 mt5.symbol_select(req.symbol, True)
                 tick = mt5.symbol_info_tick(req.symbol)
             except Exception:  # noqa: BLE001
