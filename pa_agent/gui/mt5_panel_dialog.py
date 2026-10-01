@@ -127,9 +127,20 @@ class MT5PanelDialog(QDialog):
 
         # ── 可编辑下单参数：AI 分析填默认值，用户可自行修改 ─────────────
         row1 = QHBoxLayout()
+        self._cmb_symbol = QComboBox()
+        self._cmb_symbol.setEditable(True)
+        _meta_sym = str(getattr(getattr(self._record, "meta", None), "symbol", "") or "")
+        if _meta_sym:
+            self._cmb_symbol.addItem(_meta_sym)
+            self._cmb_symbol.setCurrentText(_meta_sym)
+        self._cmb_symbol.setToolTip(
+            "品种名默认取图表数据源（如 TradingView），与 MT5 经纪商的命名可能不同\n"
+            "（例如 XAUUSD vs GOLD、CNHJPY 可能不存在）——下单前请对照\n"
+            "MT5「市场报价」窗口确认，名称不同可直接在此修改。")
         self._cb_dir = QComboBox(); self._cb_dir.addItems(["多头", "空头"])
         self._cb_kind = QComboBox(); self._cb_kind.addItems(["市价单", "限价单", "突破单"])
-        for label, widget in (("方向", self._cb_dir), ("类型", self._cb_kind)):
+        for label, widget in (("品种", self._cmb_symbol), ("方向", self._cb_dir),
+                              ("类型", self._cb_kind)):
             box = QWidget(); hb = QHBoxLayout(box); hb.setContentsMargins(0, 0, 0, 0)
             hb.addWidget(QLabel(label)); hb.addWidget(widget)
             row1.addWidget(box)
@@ -321,9 +332,8 @@ class MT5PanelDialog(QDialog):
 
     def _copy_order_info(self) -> None:
         """把当前下单参数格式化成文本复制到剪贴板。"""
-        meta = getattr(self._record, "meta", None)
-        symbol = str(getattr(meta, "symbol", "") or "未知品种")
-        timeframe = str(getattr(meta, "timeframe", "") or "")
+        symbol = self._cmb_symbol.currentText().strip() or "未知品种"
+        timeframe = str(getattr(getattr(self._record, "meta", None), "timeframe", "") or "")
         direction = self._cb_dir.currentText()
         kind = self._cb_kind.currentText()
         entry = self._t_entry.value()
@@ -357,10 +367,11 @@ class MT5PanelDialog(QDialog):
             self._acct_label.setText(f"连接失败：{exc}")
 
     def _on_send_order(self) -> None:
-        meta = getattr(self._record, "meta", None)
-        symbol = str(getattr(meta, "symbol", "") or "")
+        symbol = self._cmb_symbol.currentText().strip()
         if not symbol:
-            QMessageBox.information(self, "MT5 下单", "没有图表品种信息，请先在主窗口「获取数据」。")
+            QMessageBox.information(self, "MT5 下单",
+                                    "品种为空——请填入 MT5 经纪商的品种名称"
+                                    "（可与图表数据源的命名不同）。")
             return
         direction = "long" if self._cb_dir.currentText() == "多头" else "short"
         kind_map = {"市价单": "market", "限价单": "limit", "突破单": "stop"}

@@ -93,6 +93,16 @@ def connect(terminal_path: str = "") -> AccountInfo:
         kwargs["path"] = terminal_path.strip()
     if not mt5.initialize(**kwargs):
         raise MT5BridgeError(f"无法连接 MT5 终端（{_fmt_err()}）。请先启动并登录 MT5。")
+    # 句柄活性检查：initialize 可能因残留旧句柄返回 True 但连接已死
+    # （表现为后续 symbol_info_tick 报 -4: Terminal: Not found）。
+    # terminal_info() 为 None 即判定失效 → shutdown 重连一次。
+    if mt5.terminal_info() is None:
+        mt5.shutdown()
+        if not mt5.initialize(**kwargs):
+            raise MT5BridgeError(
+                f"MT5 终端连接已失效且重连失败（{_fmt_err()}）。"
+                "请确认终端在运行且已登录，再点「连接 MT5」。"
+            )
     acc = mt5.account_info()
     if acc is None:
         mt5.shutdown()
@@ -195,7 +205,31 @@ def _send_order_impl(req: OrderRequest, *, cfg: Any) -> OrderResult:
         lot = normalize_lot(req.lot, sym)
         tick = mt5.symbol_info_tick(req.symbol)
         if tick is None:
-            return OrderResult(False, None, None, f"无 {req.symbol} 行情报价（{_fmt_err()}）")
+            # 第一次失败先强制加入「市场报价」再取一次（部分品种未激活行情时为 None）
+            try:
+                mt5.symbol_select(req.symbol, True)
+                tick = mt5.symbol_info_tick(req.symbol)
+            except Exception:  # noqa: BLE001
+                tick = None
+        if tick is None:
+            code, msg = _fmt_err(), ""
+            try:
+                err = mt5.last_error()
+                code, msg = int(err[0]), str(err[1])
+            except Exception:  # noqa: BLE001
+                pass
+            if code == -4:
+                raise MT5BridgeError(
+                    f"无法获取 {req.symbol} 报价：与 MT5 终端的连接已断开（-4）。"
+                    "请确认终端在运行且已登录，然后在本面板重新点「连接 MT5」再下单。"
+                )
+            raise MT5BridgeError(
+                f"无法获取 {req.symbol} 报价（{code}: {msg}）。"
+                "常见原因：本经纪商没有这个品种或名称不同——图表品种名来自数据源"
+                "（如 TradingView），与 MT5 经纪商的命名可能不一致；"
+                "请在 MT5「市场报价」窗口搜索确认该品种的准确名称，"
+                "在下单页修改「品种」后再下单。"
+            )
 
         if req.direction == "long":
             otype_map = {"market": mt5.ORDER_TYPE_BUY,
