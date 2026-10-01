@@ -366,6 +366,41 @@ class MT5PanelDialog(QDialog):
             self._connected = False
             self._acct_label.setText(f"连接失败：{exc}")
 
+    def _mt5_button_hint(
+        self, direction: str, order_kind: str,
+        entry: float | None, stop_loss: float, take_profit: float | None,
+    ) -> str:
+        """生成 MT5 原生界面的操作指引（给新手看）。"""
+        # 方向映射
+        side_cn = "买入" if direction == "long" else "卖出"
+        side_en = "Buy" if direction == "long" else "Sell"
+
+        # 类型映射
+        kind_map = {
+            "market": ("市价", "Market"),
+            "limit": ("限价", "Limit"),
+            "stop": ("突破", "Stop"),
+        }
+        type_cn, type_en = kind_map.get(order_kind, ("未知", ""))
+
+        # 组合按钮名
+        button_name = f"{side_en} {type_en}" if type_en else side_en
+        button_cn = f"{side_cn}{type_cn}"
+
+        # 详细步骤
+        steps = [f"在 MT5 中点「{button_name}」"]
+        if order_kind != "market":
+            steps.append(f"  Price（价格）填 {entry}")
+        steps.extend([
+            f"  Volume（手数）填 {self._t_lot.value()}",
+            f"  Stop Loss（止损）填 {stop_loss}",
+        ])
+        if take_profit and take_profit > 0:
+            steps.append(f"  Take Profit（止盈）填 {take_profit}")
+        steps.append("最后点「下订单」或按 Enter")
+
+        return " → ".join(steps)
+
     def _on_send_order(self) -> None:
         symbol = self._cmb_symbol.currentText().strip()
         if not symbol:
@@ -388,13 +423,20 @@ class MT5PanelDialog(QDialog):
             QMessageBox.warning(self, "MT5 下单", f"{self._cb_kind.currentText()}必须填入场价。")
             return
 
+        # ── 生成 MT5 原生操作指引（给新手看） ────────────────────────
+        mt5_button = self._mt5_button_hint(
+            direction, order_kind, entry, stop_loss, take_profit
+        )
+
         if self._cfg is not None and bool(getattr(self._cfg, "confirm_required", True)):
             ok = QMessageBox.question(
                 self, "确认下单",
                 "即将向 MT5 发送真实订单：\n\n"
                 f"品种：{symbol}　方向：{self._cb_dir.currentText()}　类型：{self._cb_kind.currentText()}\n"
                 f"入场：{entry if entry else '市价'}　止损：{stop_loss}\n"
-                f"止盈：{take_profit if take_profit else '无'}　手数：{lot}\n\n确认继续？",
+                f"止盈：{take_profit if take_profit else '无'}　手数：{lot}\n\n"
+                f"👉 MT5 操作：{mt5_button}\n\n"
+                "确认继续？",
             ) == QMessageBox.StandardButton.Yes
             if not ok:
                 return
