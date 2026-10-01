@@ -147,6 +147,6 @@ make uv-run
 
 ## 联系与支持
 
-作者主页：[duckwolf.cn](https://duckwolf.cn)
+分支主页：[duckwolf.cn](https://duckwolf.cn)
 
 如果你觉得这个程序对你有帮助，欢迎访问上方网站了解更多项目或留言交流。
