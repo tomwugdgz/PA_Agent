@@ -299,6 +299,81 @@ def test_report_is_data_driven() -> None:
     print("  [OK] 报告随数据变化：涨/跌两批数据状态文本不同，区间边界各自独立")
 
 
+def test_branch_derivation() -> None:
+    """三分支推导：恰好 3 个、多空概率可区分、虚高 RR 被惩罚。
+
+    防三类回归：
+      1. 分支数不等于 3（少一个方向 / 排序错乱）
+      2. 多空概率完全相同（未按 bull/bear 分布拆分）
+      3. 虚高 RR（>10）反而被当成"达标"加分
+    """
+    from types import SimpleNamespace
+
+    from pa_agent.config.settings import Settings
+    from pa_agent.report.laya_branches import (
+        _direction_probs,
+        _structure_factor,
+        derive_branches,
+    )
+
+    cfg = Settings().laya
+
+    # ── 方向拆分：多空必须能区分 ──
+    answers = {
+        "方向": SimpleNamespace(
+            value="bearish", confidence=0.15,
+            probabilities={"bullish": 0.31, "bearish": 0.57, "neutral": 0.12},
+        ),
+        "信号有效": SimpleNamespace(value=0.68, confidence=0.68, probabilities={}),
+        "噪音区": SimpleNamespace(value=0.67, confidence=0.67, probabilities={}),
+        "尺度冲突": SimpleNamespace(value=0.62, confidence=0.62, probabilities={}),
+        "突破质量": SimpleNamespace(value="close_breakout", confidence=0.32, probabilities={}),
+    }
+    bull, bear = _direction_probs(answers)
+    assert bear > bull, f"看空应大于看多（0.57 vs 0.31），实得 bull={bull:.4f} bear={bear:.4f}"
+    assert bull + bear < 0.31, "拆分后绝对值应被校准压缩，不能等于原始 0.31"
+
+    # ── 虚高 RR 必须被惩罚 ──
+    f_ok, _ = _structure_factor(
+        direction="long", has_structure=True, rr=2.0, risk_in_atr=1.2, actionable=True
+    )
+    f_bad, r_bad = _structure_factor(
+        direction="long", has_structure=True, rr=91.0, risk_in_atr=0.35, actionable=True
+    )
+    assert f_bad < f_ok, f"虚高 RR+过近止损应被严惩：bad={f_bad:.2f} ok={f_ok:.2f}"
+    assert any("虚高" in x for x in r_bad), "扣分明细必须指出 RR 虚高"
+    assert any("统计意义" in x for x in r_bad), "扣分明细必须指出 R 无统计意义"
+
+    # ── 端到端：恰好 3 个分支且按概率降序 ──
+    features = SimpleNamespace(
+        supports=(1.14788,), resistances=(1.17327,),
+        range_high=1.2094, range_low=1.14788,
+        invalidation_long=1.14788, invalidation_short=1.17327,
+        measured_moves=(), swing_structure="insufficient",
+    )
+    branches = derive_branches(
+        close=1.17277, atr=0.001582, features=features, cfg=cfg, answers=answers
+    )
+    assert len(branches) == 3, f"应恰好 3 个分支，实得 {len(branches)}"
+    keys = {b.key for b in branches}
+    assert keys == {"long", "short", "wait"}, f"分支 key 应为 多/空/观望，实得 {keys}"
+    probs = [b.probability for b in branches]
+    assert probs == sorted(probs, reverse=True), f"应按概率降序，实得 {probs}"
+    lng = [b for b in branches if b.key == "long"][0]
+    sht = [b for b in branches if b.key == "short"][0]
+    # 防"下限钳制掩盖真实差异"：两侧都远低于 0.10 时仍必须可区分
+    assert sht.probability > lng.probability, (
+        f"看空应严格高于看多（bearish 0.57 > bullish 0.31），"
+        f"实得 long={lng.probability:.4f} short={sht.probability:.4f}"
+    )
+    assert lng.low_prob and sht.low_prob, "两侧均 <10% 时都应标记为低概率"
+    wait = [b for b in branches if b.key == "wait"][0]
+    assert not wait.actionable, "观望分支绝不能标记为可执行"
+    print(f"  [OK] 三分支推导：3 个分支（多/空/观望）、按概率降序、"
+          f"多空可区分（{lng.probability:.0%} vs {sht.probability:.0%}）、"
+          f"低概率已标注、虚高 RR 被惩罚")
+
+
 def main() -> None:
     print("── Laya 板块冒烟（弱监督 + 校准数据）──")
     test_efficiency_ratio()
@@ -317,6 +392,7 @@ def main() -> None:
     test_confidence_filter()
     test_calibration_path_is_next_to_weights()
     test_report_is_data_driven()
+    test_branch_derivation()
     print("全部通过 ✅")
 
 

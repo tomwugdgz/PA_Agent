@@ -42,6 +42,9 @@ class LayaReport:
     resistances: tuple[float, ...] = ()
     state_text: str = ""
     errors: tuple[str, ...] = field(default_factory=tuple)
+    #: 三分支交易判断（多/空/观望 + 复合概率），由 report/laya_branches.py 生成。
+    #: 放在最后并给默认值，保证旧调用方（只传前14 个字段）不受影响。
+    branches: tuple[Any, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         """机器可读快照（写入标注数据集 / 供后续回测）。"""
@@ -71,8 +74,31 @@ class LayaReport:
             },
             "long_plan": _plan_dict(self.long_plan),
             "short_plan": _plan_dict(self.short_plan),
+            "branches": [_branch_dict(b) for b in self.branches],
             "errors": list(self.errors),
         }
+
+
+def _branch_dict(b: Any) -> dict[str, Any]:
+    """把一个 Branch 序列化成机器可读结构。
+
+    刻意用鸭子类型（``getattr``）而非 isinstance——``laya_branches`` 里的
+    ``Branch`` 是 frozen dataclass，但分支推导是可选功能，报告渲染时
+    拿到 dict 形态（历史 JSON 回读）也不该崩。
+    """
+    if isinstance(b, dict):
+        return dict(b)
+    plan = getattr(b, "plan", None)
+    return {
+        "key": getattr(b, "key", ""),
+        "label": getattr(b, "label", ""),
+        "probability": round(float(getattr(b, "probability", 0.0)), 4),
+        "actionable": bool(getattr(b, "actionable", False)),
+        "low_prob": bool(getattr(b, "low_prob", False)),
+        "basis": getattr(b, "basis", ""),
+        "factors": list(getattr(b, "factors", ()) or ()),
+        "plan": _plan_dict(plan) if plan is not None else None,
+    }
 
 
 def _pred_get(pred, key, default=None):
@@ -107,6 +133,56 @@ def _plan_dict(p: PricePlan) -> dict[str, Any]:
 
 
 # ── Markdown 渲染 ────────────────────────────────────────────────────────────
+
+
+def _branches_md(r: LayaReport, L: list[str]) -> None:
+    """三分支判断的 Markdown 段落（与 HTML 卡片同源同数据）。"""
+    branches = list(getattr(r, "branches", ()) or ())
+    if not branches:
+        return
+
+    L.append("## 二、三分支判断（同一份数据推导）")
+    L.append("")
+    L.append(
+        "> 概率 = Laya **校准后**概率 × 信号质量系数 × 结构确定性系数。"
+        "刻意不使用 Laya 原始 `probabilities`——那是未校准值，"
+        "方向题实测虚高约 1.94 倍（原始 0.57 → 校准后 0.15），"
+        "直接排序会给出接近随机的假高概率。"
+    )
+    L.append("")
+
+    for rank, b in enumerate(branches, 1):
+        if isinstance(b, dict):
+            continue
+        key = str(getattr(b, "key", "") or "wait")
+        label = getattr(b, "label", key)
+        prob = float(getattr(b, "probability", 0.0) or 0.0)
+        plan = getattr(b, "plan", None)
+
+        L.append(f"### #{rank} {label}　复合概率 {prob:.0%}")
+        L.append("")
+        if bool(getattr(b, "low_prob", False)) and key != "wait":
+            L.append("> ⚠️ **低概率分支（<10%）**：建议观望或极小仓位。")
+            L.append("")
+        L.append(f"- 概率构成：{getattr(b, 'basis', '')}")
+        for f in getattr(b, "factors", ()) or ():
+            L.append(f"  - {f}")
+
+        if plan is not None:
+            if not getattr(plan, "actionable", False) and key == "wait":
+                L.append(f"- 观察区间：{plan.stop} ～ {plan.entry}（**非交易计划，不建议下单**）")
+                L.append(f"- 观望理由：{plan.reason}")
+            elif not getattr(plan, "actionable", False):
+                L.append(f"- 不出价：{plan.reason}")
+            else:
+                rr = f"，盈亏比 ≈ {plan.rr_ratio}" if plan.rr_ratio else ""
+                L.append(
+                    f"- 挂单价 **{plan.entry}**　止损 **{plan.stop}**"
+                    f"　目标 **{plan.target}**{rr}"
+                )
+            for n in getattr(plan, "notes", ()) or ():
+                L.append(f"  - {n}")
+        L.append("")
 
 
 def render_markdown(r: LayaReport) -> str:
@@ -146,8 +222,11 @@ def render_markdown(r: LayaReport) -> str:
         L.append(f"- ⚠️ {len(low_conf)} 项答案低于置信度门槛，相关价格建议已标注为不可靠。")
     L.append("")
 
-    # ── 2. 价格计划
-    L.append("## 二、价格计划（确定性计算：结构位优先 + ATR 兜底）")
+    # ── 2. 三分支判断
+    _branches_md(r, L)
+
+    # ── 3. 价格计划
+    L.append("## 三、价格计划（确定性计算：结构位优先 + ATR 兜底）")
     L.append("")
     for plan in (r.long_plan, r.short_plan):
         act = _ACT_ZH.get(plan.direction, plan.direction)
@@ -172,7 +251,7 @@ def render_markdown(r: LayaReport) -> str:
         L.append("")
 
     # ── 3. 判据明细
-    L.append("## 三、判据明细（Laya 原语输出）")
+    L.append("## 四、判据明细（Laya 原语输出）")
     L.append("")
     L.append("| 问题 | 类型 | 答案 | 置信度 | 可信 |")
     L.append("|---|---|---|---|---|")
@@ -200,7 +279,7 @@ def render_markdown(r: LayaReport) -> str:
             L.append("")
 
     # ── 4. 市场状态
-    L.append("## 四、喂给模型的市场状态（可复核）")
+    L.append("## 五、喂给模型的市场状态（可复核）")
     L.append("")
     L.append("```text")
     L.append(r.state_text)
@@ -264,6 +343,41 @@ _HTML_TMPL = """<!DOCTYPE html>
   .foot {{ margin-top: 36px; color: #6E6E73; font-size: 12px;
            border-top: 1px solid #E5E5EA; padding-top: 16px; }}
   .na {{ color: #8E8E93; }}
+  /* ── 三分支卡片 ── */
+  .branch {{ background: #fff; border: 1px solid #E5E5EA; border-radius: 12px;
+            padding: 18px 22px; margin: 12px 0; }}
+  .branch.long {{ border-left: 4px solid #D62728; }}
+  .branch.short {{ border-left: 4px solid #1A9850; }}
+  .branch.wait {{ border-left: 4px solid #8E8E93; }}
+  .branch-hd {{ display: flex; align-items: baseline; gap: 10px;
+               flex-wrap: wrap; margin-bottom: 6px; }}
+  .branch-rank {{ font-size: 12px; color: #fff; background: #1D1D1F;
+                 border-radius: 999px; padding: 2px 9px; font-weight: 600; }}
+  .branch-rank.long {{ background: #D62728; }}
+  .branch-rank.short {{ background: #1A9850; }}
+  .branch-rank.wait {{ background: #8E8E93; }}
+  .branch-name {{ font-size: 17px; font-weight: 700; }}
+  .branch-prob {{ margin-left: auto; font-size: 20px; font-weight: 700;
+                  font-variant-numeric: tabular-nums; }}
+  .branch-prob.long {{ color: #D62728; }}
+  .branch-prob.short {{ color: #1A9850; }}
+  .branch-prob.wait {{ color: #6E6E73; }}
+  .pbar {{ height: 8px; background: #F0F0F2; border-radius: 4px;
+           overflow: hidden; margin: 8px 0 12px; }}
+  .pbar i {{ display: block; height: 100%; }}
+  .pbar.long i {{ background: #D62728; }}
+  .pbar.short i {{ background: #1A9850; }}
+  .pbar.wait i {{ background: #8E8E93; }}
+  .basis {{ background: #FAFAFC; border: 1px solid #F0F0F2; border-radius: 8px;
+           padding: 9px 12px; font-size: 12px; color: #6E6E73; margin: 8px 0; }}
+  .basis b {{ color: #1D1D1F; font-weight: 600; }}
+  .lv {{ display: flex; gap: 18px; flex-wrap: wrap; margin: 8px 0;
+         font-variant-numeric: tabular-nums; }}
+  .lv > div {{ font-size: 13px; }}
+  .lv span {{ color: #6E6E73; font-size: 12px; }}
+  .lv b {{ font-size: 15px; }}
+  .tag-no {{ display: inline-block; background: #FEF3C7; border: 1px solid #FDE68A;
+            color: #B45309; border-radius: 6px; padding: 1px 8px; font-size: 12px; }}
 </style>
 </head>
 <body><div class="wrap">
@@ -284,6 +398,8 @@ _HTML_TMPL = """<!DOCTYPE html>
   {signal_line}
 </div>
 {low_conf_html}
+
+{branches_html}
 
 <h2>价格计划 <span class="muted">（结构位优先 + ATR 兜底，确定性计算）</span></h2>
 {plans_html}
@@ -307,6 +423,93 @@ Laya 未微调时置信度不可靠，仅作决策辅助；所有价格均由结
 </div>
 </div></body></html>
 """
+
+
+def _branches_html(r: LayaReport) -> str:
+    """三分支交易判断卡片：多/空/观望 + 复合概率 + 完整三价位。
+
+    概率是「Laya 校准后置信度 × 信号质量 × 结构确定性」的复合值，
+    并在卡片里把算法写出来——不给黑箱数字。
+    """
+    branches = list(getattr(r, "branches", ()) or ())
+    if not branches:
+        return ""
+
+    rows: list[str] = [
+        '<h2>三分支判断（同一份数据推导）</h2>',
+        '<div class="warn">概率 = Laya <b>校准后</b>置信度 × 信号质量系数 × 结构确定性系数。'
+        '刻意不使用 Laya 原始 probabilities——那是未校准值，方向题实测虚高约 1.94 倍'
+        '（原始 0.57 → 校准后 0.15），直接排序会给出接近随机的假高概率。</div>',
+    ]
+
+    for rank, b in enumerate(branches, 1):
+        if isinstance(b, dict):
+            continue
+        key = str(getattr(b, "key", "") or "wait")
+        label = html.escape(str(getattr(b, "label", key)))
+        prob = float(getattr(b, "probability", 0.0) or 0.0)
+        basis = html.escape(str(getattr(b, "basis", "")))
+        factors = list(getattr(b, "factors", ()) or ())
+        plan = getattr(b, "plan", None)
+        actionable = bool(getattr(b, "actionable", False))
+        low_prob = bool(getattr(b, "low_prob", False)) and key != "wait"
+
+        pct = max(0.0, min(1.0, prob)) * 100.0
+        factors_html = (
+            "<div class='basis'><b>扣分明细</b><br>"
+            + "<br>".join(html.escape(str(f)) for f in factors)
+            + "</div>"
+            if factors
+            else ""
+        )
+
+        if plan is None:
+            lv_html = "<div class='muted'>无价格计划</div>"
+        elif not actionable and key == "wait":
+            # 观望：价位是观察区间，不是交易计划
+            lv_html = (
+                f"<div class='lv'>"
+                f"<div><span>区间上沿 </span><b>{plan.entry}</b></div>"
+                f"<div><span>区间下沿 </span><b>{plan.stop}</b></div>"
+                f"</div>"
+                f"<div class='muted'>{html.escape(plan.reason)}</div>"
+                f"<div><span class='tag-no'>不建议下单</span></div>"
+            )
+        elif not actionable:
+            lv_html = (
+                f"<div class='price na'>不出价</div>"
+                f"<div class='muted'>{html.escape(plan.reason)}</div>"
+            )
+        else:
+            rr_txt = f"<span class='muted'>（R = {plan.risk_per_unit}）</span>" if plan.risk_per_unit else ""
+            rr2 = f"<span class='muted'>（盈亏比 ≈ {plan.rr_ratio}）</span>" if plan.rr_ratio else ""
+            notes = "".join(
+                f"<div class='muted'>{html.escape(n)}</div>" for n in (plan.notes or ())
+            )
+            lv_html = (
+                f"<div class='lv'>"
+                f"<div><span>挂单价 </span><b class='price'>{plan.entry}</b></div>"
+                f"<div><span>止损 </span><b class='price'>{plan.stop}</b>{rr_txt}</div>"
+                f"<div><span>目标 </span><b class='price'>{plan.target}</b>{rr2}</div>"
+                f"</div>" + notes
+            )
+
+        rows.append(
+            f'<div class="branch {key}">'
+            f'<div class="branch-hd">'
+            f'<span class="branch-rank {key}">#{rank}</span>'
+            f'<span class="branch-name">{label}</span>'
+            f'<span class="branch-prob {key}">{prob:.0%}</span>'
+            f"</div>"
+            f'<div class="pbar {key}"><i style="width:{pct:.1f}%"></i></div>'
+            f'<div class="basis"><b>概率构成</b> · {basis}</div>'
+            f"{factors_html}"
+            f"{'<div><span class=\'tag-no\'>低概率分支（<10%），建议观望或极小仓位</span></div>' if low_prob else ''}"
+            f"{lv_html}"
+            f"</div>"
+        )
+
+    return "\n".join(rows)
 
 
 def _plan_html(p: PricePlan) -> str:
@@ -510,6 +713,8 @@ def render_html(r: LayaReport) -> str:
     mt5_action_html = _mt5_action_card(r)
     # ── 置信度可信度卡片（明确该不该信） ────────────────────────────
     trust_html = _confidence_trust_card(r)
+    # ── 三分支交易判断（多/空/观望 + 复合概率） ─────────────────────
+    branches_html = _branches_html(r)
 
     fmt = lambda v: "—" if v is None else str(v)  # noqa: E731
     return _HTML_TMPL.format(
@@ -521,6 +726,7 @@ def render_html(r: LayaReport) -> str:
         errors_html=errors_html,
         mt5_action_html=mt5_action_html,
         trust_html=trust_html,
+        branches_html=branches_html,
         direction_zh=direction_zh,
         direction_conf=(f"{dire.confidence * 100:.0f}%" if dire else "—"),
         struct_line=(

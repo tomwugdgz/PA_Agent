@@ -214,6 +214,28 @@ def generate_report(frame: Any, settings: Any, progress: Any = None) -> LayaRepo
         errors=tuple(errors),
     )
 
+    # ── 三分支推导（多/空/观望 + 复合概率），失败绝不阻断报告
+    try:
+        from dataclasses import replace
+
+        from pa_agent.report.laya_branches import derive_branches
+
+        report = replace(
+            report,
+            branches=tuple(
+                derive_branches(
+                    close=close,
+                    atr=atr,
+                    features=features,
+                    cfg=cfg,
+                    answers=answers,
+                    tick=tick,
+                )
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Laya 分支推导失败，报告仍照常输出：%s", exc)
+
     # ── 标注数据收集（失败静默，绝不影响报告）
     if bool(getattr(cfg, "collect_annotations", False)):
         append_sample(
