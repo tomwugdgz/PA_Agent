@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -66,6 +67,38 @@ MIN_SAMPLES = 120
 #: 官方分桶门槛：``laya.calibrate.MIN_BUCKET_N``。分桶温度需要每桶 2000 条，
 #: 达不到就只出类型级标量（MIN_TYPE_N=10）。这里用于提示用户。
 OFFICIAL_MIN_BUCKET_N = 2000
+
+
+def _normalize_identity_field(cal_path: Path) -> bool:
+    """把校准文件里的 ``model_id_or_path`` 归一化成 agent 实际持有的形态。
+
+    上游 ``laya.calibrate._warn_if_identity_mismatch`` 用**字符串相等**判断
+    校准是否匹配当前模型。而 ``settings.json`` 里``model_dir`` 惯用正斜杠
+    （``C:/Users/...``），agent 内部保存的却是反斜杠（``C:\\Users\\...``），
+    于是每次加载都会刷一条误报警告::
+
+        UserWarning: calibration was fitted for model_id_or_path='C:/...'
+        but this agent is model_id_or_path='C:\\...'. Loading anyway.
+
+    温度**确实照常加载**（上游只是warn 后继续），所以这是纯噪音问题。
+    这里只改写记录字段，不动任何温度数值。
+    """
+    try:
+        payload = json.loads(cal_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    recorded = payload.get("model_id_or_path")
+    if not isinstance(recorded, str) or not recorded:
+        return False
+    # os.path.normpath 会把正斜杠统一成本机原生分隔符（Windows 下为反斜杠）
+    normalized = os.path.normpath(recorded)
+    if normalized == recorded:
+        return False
+    payload["model_id_or_path"] = normalized
+    cal_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return True
 
 
 def _collect_records(agent: Any, pairs: list) -> list:
@@ -255,6 +288,7 @@ def run_calibration(
     # ── 落盘 ────────────────────────────────────────────────────────────
     out_path.parent.mkdir(parents=True, exist_ok=True)
     agent.save_calibration(str(out_path))
+    _normalize_identity_field(out_path)
     print(f"\n✅ 校准已保存：{out_path}")
     print("   下次加载 Laya 时自动生效（engine 会读同一路径），无需改配置。")
 

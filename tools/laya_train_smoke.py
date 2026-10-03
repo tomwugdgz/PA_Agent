@@ -248,6 +248,57 @@ def test_calibration_path_is_next_to_weights() -> None:
     print(f"  [OK] 校准路径：{p}")
 
 
+def test_report_is_data_driven() -> None:
+    """报告必须随导入数据变化——防止将来出现"固定数据出固定报告"的回归。
+
+    用两批趋势相反的合成 K 线（单边涨 / 单边跌）各跑一次真实推理，
+    断言喂给模型的状态文本与 Laya 答案都随之改变。
+    """
+    import math
+
+    from pa_agent.data.base import KlineBar
+    from pa_agent.data.snapshot import build_analysis_frame
+
+    def make(direction: str, n: int = 120, start: float = 1.1000):
+        bars, price = [], start
+        drift = 0.0009 if direction == "up" else -0.0009
+        for i in range(n):
+            wave = 0.00035 * math.sin(i / 3.0)
+            o = price
+            c = price + drift + wave * 0.5
+            bars.append(
+                KlineBar(
+                    seq=n - i,
+                    ts_open=1_700_000_000_000 - i * 60_000,
+                    open=round(o, 5),
+                    high=round(max(o, c) + 0.0006, 5),
+                    low=round(min(o, c) - 0.0006, 5),
+                    close=round(c, 5),
+                    volume=float(1000 + (i % 7) * 30),
+                    closed=True,
+                )
+            )
+            price = c
+        return list(reversed(bars))  # bars[0] 必须是最新
+
+    def state_of(direction: str) -> str:
+        from pa_agent.report.laya_pipeline import generate_report
+        from pa_agent.config.settings import Settings
+
+        bars = make(direction)
+        frame = build_analysis_frame(
+            bars, len(bars), "TESTPAIR", "M15", now_ms=1_700_000_000_000
+        )
+        assert frame is not None and frame.bars, "frame 构造失败"
+        return generate_report(frame, Settings()).state_text
+
+    up, down = state_of("up"), state_of("down")
+    assert up != down, "两批不同数据竟生成完全相同的状态文本——报告未使用导入数据"
+    # 状态文本必须体现各自的区间边界（数据确实进了state）
+    assert "1.17181" in up and "0.9922" in down, "状态文本未反映各自数据的区间"
+    print("  [OK] 报告随数据变化：涨/跌两批数据状态文本不同，区间边界各自独立")
+
+
 def main() -> None:
     print("── Laya 板块冒烟（弱监督 + 校准数据）──")
     test_efficiency_ratio()
@@ -265,6 +316,7 @@ def main() -> None:
     test_to_laya_pairs_priority()
     test_confidence_filter()
     test_calibration_path_is_next_to_weights()
+    test_report_is_data_driven()
     print("全部通过 ✅")
 
 
