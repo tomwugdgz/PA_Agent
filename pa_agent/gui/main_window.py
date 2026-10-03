@@ -1643,13 +1643,21 @@ class MainWindow(QMainWindow):
 
             def _do_preload():
                 try:
+                    from pa_agent.ai.laya_annotation import load_calibration_if_any
+
+                    cal = (load_calibration_if_any(laya_cfg.model_dir)
+                           if bool(getattr(laya_cfg, "use_calibration", True)) else None)
                     engine = LayaEngine.get(
                         model_dir=laya_cfg.model_dir,
                         subfolder=laya_cfg.subfolder,
                         device=getattr(laya_cfg, "device", "auto"),
+                        calibration=cal,
                     )
                     engine.ensure_loaded()
-                    logger.info("✅ Laya 权重预加载完成（后续报告秒开）")
+                    logger.info(
+                        "✅ Laya 权重预加载完成（后续报告秒开%s）",
+                        "，已挂载置信度校准" if engine.calibrated else "",
+                    )
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("Laya 预加载失败（不影响主流程）: %s", exc)
 

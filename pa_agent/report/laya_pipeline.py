@@ -135,10 +135,18 @@ def generate_report(frame: Any, settings: Any, progress: Any = None) -> LayaRepo
 
     features = compute_simple_market_features(frame)
 
+    # 校准文件（若存在且开关打开）自动挂载——置信度标定后才有参考价值
+    cal = None
+    if bool(getattr(cfg, "use_calibration", True)):
+        from pa_agent.ai.laya_annotation import load_calibration_if_any
+
+        cal = load_calibration_if_any(cfg.model_dir)
+
     engine = LayaEngine.get(
         model_dir=cfg.model_dir,
         subfolder=cfg.subfolder,
         device=_resolve_device(cfg),
+        calibration=cal,
     )
     agent = engine.ensure_loaded(progress=progress)  # 校验 + 加载（幂等）
     del agent
@@ -176,6 +184,7 @@ def generate_report(frame: Any, settings: Any, progress: Any = None) -> LayaRepo
         latency_ms=latency_ms,
         load_ms=engine.load_ms,
         device=engine.device,
+        calibrated=bool(getattr(engine, "calibrated", False)),
     )
 
     # ── 方向决定价格计划的主次（但两个方向都算，报告都展示）

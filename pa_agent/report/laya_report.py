@@ -67,6 +67,7 @@ class LayaReport:
                 "usage": self.prediction.usage,
                 "latency_ms": self.prediction.latency_ms,
                 "device": self.prediction.device,
+                "calibrated": self.prediction.calibrated,
             },
             "long_plan": _plan_dict(self.long_plan),
             "short_plan": _plan_dict(self.short_plan),
@@ -121,6 +122,9 @@ def render_markdown(r: LayaReport) -> str:
     L.append(f"- 生成时间：{r.generated_at}")
     L.append(f"- 推理设备：{pred.device or '未知'}（加载 {pred.load_ms / 1000:.1f}s，推理 {pred.latency_ms:.0f}ms）")
     L.append(f"- 现价：{r.close if r.close is not None else '—'}　ATR14：{r.atr if r.atr is not None else '—'}")
+    cal = "已启用" if getattr(pred, "calibrated", False) else \
+        "未启用（零样本置信度天然偏低，建议先积累标注再校准）"
+    L.append(f"- 置信度校准：{cal}")
     L.append("")
 
     # ── 1. 结论卡
@@ -270,6 +274,8 @@ _HTML_TMPL = """<!DOCTYPE html>
 
 {mt5_action_html}
 
+{trust_html}
+
 <h2>结论</h2>
 <div class="card">
   <div class="big">{direction_zh}</div>
@@ -388,6 +394,60 @@ def _mt5_action_card(r: LayaReport) -> str:
     return "".join(html_parts)
 
 
+def _confidence_trust_card(r: LayaReport) -> str:
+    """置信度可信度卡片——明确告诉用户「这份结论该信到什么程度」。
+
+    Laya 零样本的置信度普遍在 0.14~0.17（作者原话 near chance），直接照着
+    下单等于抛硬币。本卡片做三件事：
+      1. 显示校准状态（有没有挂载 calibration.json）
+      2. 给置信度分级（够不够格据此下单）
+      3. 明确写出「不可信时该怎么办」——不是只报一个数字
+    """
+    pred = r.prediction
+    answers = getattr(pred, "answers", {}) or {}
+    if not isinstance(answers, dict):
+        return ""
+    # 方向题是唯一直接驱动买卖的题，优先看它
+    dire = answers.get("方向")
+    conf = float(getattr(dire, "confidence", 0.0) or 0.0) if dire else 0.0
+    reliable = bool(getattr(dire, "reliable", False)) if dire else False
+    calibrated = bool(getattr(pred, "calibrated", False))
+
+    # 分级：门槛与 settings.laya.min_confidence 保持一致（0.35）
+    if conf >= 0.60:
+        level, color, advice = "高", "#1A9850", "可作为下单依据，但仍建议叠加你自己的判断"
+    elif conf >= 0.35:
+        level, color, advice = "中", "#B8860B", "仅作参考，建议等信号更明确再动手"
+    elif conf >= 0.20:
+        level, color, advice = "低", "#D2691E", "不建议据此下单，先看结构位和回测结果"
+    else:
+        level, color, advice = "极低（接近随机）", "#D62728", "不要据此下单——这是模型的猜测，不是判断"
+
+    cal_line = (
+        "<b>已启用</b>" if calibrated else
+        "<b>未启用</b>——零样本置信度天然偏低，"
+        "建议先跑 <code>tools/weak_label.py</code> 积累样本，"
+        "再跑 <code>tools/calibrate_laya.py</code>"
+    )
+    bits = [f"<div class='card' style='border-left: 4px solid {color};'>"]
+    bits.append("<div style='font-size: 16px; font-weight: 700; margin-bottom: 6px;'>"
+                "📊 置信度可信度</div>")
+    bits.append(
+        f"<div style='line-height: 1.9;'>"
+        f"方向判断置信度：<b style='color: {color}; font-size: 15px;'>{conf:.0%}</b>"
+        f"（等级：{level}）<br>"
+        f"置信度校准：{cal_line}"
+        f"<br>建议：{html.escape(advice)}</div>"
+    )
+    if not reliable:
+        bits.append(
+            "<div style='margin-top: 6px; color: #D62728;'>"
+            "⚠️ 该结论未跨过可靠性门槛，价格计划仅供参考，不构成交易建议。</div>"
+        )
+    bits.append("</div>")
+    return "".join(bits)
+
+
 def render_html(r: LayaReport) -> str:
     """HTML 报告。极简未来主义：#F5F5F7 底 / #1D1D1F 字 / #FF5C1A 强调。"""
     pred = r.prediction
@@ -448,6 +508,8 @@ def render_html(r: LayaReport) -> str:
 
     # ── MT5 操作指引卡片（给新手看） ────────────────────────────────
     mt5_action_html = _mt5_action_card(r)
+    # ── 置信度可信度卡片（明确该不该信） ────────────────────────────
+    trust_html = _confidence_trust_card(r)
 
     fmt = lambda v: "—" if v is None else str(v)  # noqa: E731
     return _HTML_TMPL.format(
@@ -458,6 +520,7 @@ def render_html(r: LayaReport) -> str:
         latency_ms=pred.latency_ms,
         errors_html=errors_html,
         mt5_action_html=mt5_action_html,
+        trust_html=trust_html,
         direction_zh=direction_zh,
         direction_conf=(f"{dire.confidence * 100:.0f}%" if dire else "—"),
         struct_line=(

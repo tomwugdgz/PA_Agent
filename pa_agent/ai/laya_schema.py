@@ -137,6 +137,8 @@ class LayaPrediction:
     latency_ms: float = 0.0
     #: 加载耗时（首次）与设备，用于报告页脚说明
     load_ms: float = 0.0
+    #: 是否挂载了置信度校准（calibration.json）。False = 零样本原始置信度
+    calibrated: bool = False
     device: str = ""
 
     def get(self, qid: str) -> LayaAnswer | None:

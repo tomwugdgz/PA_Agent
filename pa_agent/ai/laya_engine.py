@@ -88,19 +88,24 @@ class LayaEngine:
     _lock = threading.Lock()
     _instance: "LayaEngine | None" = None
 
-    def __init__(self, *, model_dir: str, subfolder: str, device: str) -> None:
+    def __init__(self, *, model_dir: str, subfolder: str, device: str,
+             calibration: str | None = None) -> None:
         self.model_dir = model_dir
         self.subfolder = subfolder
         self.device_req = device
+        #: 校准文件路径（温度标量）。None = 未校准，走模型自带温度
+        self.calibration = calibration
         self._agent: Any = None
         self._infer_lock = threading.Lock()
         self.load_ms: float = 0.0
         self.device: str = ""
+        self.calibrated: bool = False
 
     # ── 单例管理 ─────────────────────────────────────────────────────────────
 
     @classmethod
-    def get(cls, *, model_dir: str, subfolder: str, device: str) -> "LayaEngine":
+    def get(cls, *, model_dir: str, subfolder: str, device: str,
+            calibration: str | None = None) -> "LayaEngine":
         """按配置取单例；配置变化（如换权重目录）时重建。
 
         加载本身放到 `ensure_loaded()`，本方法只建壳，便于先在 UI 线程
@@ -113,9 +118,11 @@ class LayaEngine:
                 and inst.model_dir == model_dir
                 and inst.subfolder == subfolder
                 and inst.device_req == device
+                and inst.calibration == calibration
             ):
                 return inst
-            cls._instance = cls(model_dir=model_dir, subfolder=subfolder, device=device)
+            cls._instance = cls(model_dir=model_dir, subfolder=subfolder,
+                                device=device, calibration=calibration)
             return cls._instance
 
     @classmethod
@@ -159,26 +166,57 @@ class LayaEngine:
 
             _prepare_offline_env()
             t0 = time.perf_counter()
+            cal_path = self.calibration
+            if cal_path:
+                # 校准文件损坏不该阻断推理——退回未校准并明确告知
+                try:
+                    if not Path(cal_path).is_file():
+                        logger.warning("校准文件不存在，忽略：%s", cal_path)
+                        cal_path = None
+                except OSError:
+                    cal_path = None
             try:
                 import laya
 
                 device = self.device_req
                 if device in ("", "auto"):
                     device = None  # laya 自己解析：cuda > mps > xpu > cpu
-                agent = laya.load(
-                    self.model_dir,
-                    subfolder=self.subfolder or None,
-                    device=device,
-                )
+                kwargs: dict[str, Any] = {
+                    "subfolder": self.subfolder or None,
+                    "device": device,
+                }
+                if cal_path:
+                    kwargs["calibration"] = cal_path
+                agent = laya.load(self.model_dir, **kwargs)
             except LayaUnavailable:
                 raise
             except Exception as exc:  # noqa: BLE001
-                raise LayaUnavailable(f"Laya 权重加载失败：{type(exc).__name__}: {exc}") from exc
+                if cal_path:
+                    # 校准是附加能力：加载失败就退回未校准，而不是整份报告失败
+                    logger.warning("加载校准失败（%s），退回未校准推理", exc)
+                    try:
+                        import laya
+
+                        agent = laya.load(self.model_dir,
+                                          subfolder=self.subfolder or None,
+                                          device=(None if self.device_req in ("", "auto")
+                                                  else self.device_req))
+                        cal_path = None
+                    except Exception as exc2:  # noqa: BLE001
+                        raise LayaUnavailable(
+                            f"Laya 权重加载失败：{type(exc2).__name__}: {exc2}"
+                        ) from exc2
+                else:
+                    raise LayaUnavailable(
+                        f"Laya 权重加载失败：{type(exc).__name__}: {exc}"
+                    ) from exc
             self.load_ms = (time.perf_counter() - t0) * 1000
             self.device = str(getattr(agent, "device", ""))
+            self.calibrated = bool(cal_path)
             _emit(
                 progress, 80,
-                f"权重加载完成（{self.load_ms / 1000:.1f}s，设备 {self.device or '?'}）",
+                f"权重加载完成（{self.load_ms / 1000:.1f}s，设备 {self.device or '?'}"
+                f"{'，已校准' if self.calibrated else ''}）",
             )
             logger.info(
                 "Laya loaded in %.1fs (device=%s, dir=%s/%s)",

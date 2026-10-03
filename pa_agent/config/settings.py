@@ -179,7 +179,11 @@ class LayaSettings(BaseModel):
     device: str = "auto"
     #: 低置信度门槛：低于此值的答案在报告中标注「不可信」，不参与价格建议生成
     min_confidence: float = Field(default=0.35, ge=0.0, le=1.0)
-    #: 是否把每次 Laya 调用写入标注数据集（用于后续微调），见 ai/laya_annotation.py
+    #: 是否自动挂载置信度校准文件。校准文件路径固定为
+    #: ``<model_dir>/../calibration.json``（由 tools/calibrate_laya.py 生成）。
+    #: 换权重目录会自动失效——旧模型的温度对新模型无意义。
+    use_calibration: bool = True
+    #: 是否把每次 Laya 调用写入标注数据集（用于后续微调/校准），见 ai/laya_annotation.py
     collect_annotations: bool = True
 
     #: ── 定价参数（混合口径：结构优先 + ATR 兜底） ─────────────────────────
