@@ -208,7 +208,9 @@ class MT5Settings(BaseModel):
     #: 默认下单手数
     default_lot: float = Field(default=0.01, gt=0.0)
     #: 最大允许点差（point 为单位）；实际点差超过此值拒绝下单，0=不检查
-    max_spread_points: int = Field(default=0, ge=0)
+    max_spread_points: int = Field(default=50, ge=0)
+    #: 同品种同方向最大持仓笔数（含本程序 magic 的持仓+挂单）；0=不限制
+    max_same_symbol_positions: int = Field(default=1, ge=0)
     #: 下单前强制确认弹窗（建议保持 True；关闭属高风险行为）
     confirm_required: bool = True
     #: 挂单有效期（根 K 线）；到期未成交自动撤单，0=不过期（由 EA 端 EXP_DOU 条件控制）

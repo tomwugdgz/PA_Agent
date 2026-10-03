@@ -30,6 +30,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from pa_agent.ai.laya_schema import build_questions
 from pa_agent.report.laya_pipeline import generate_report
 from pa_agent.report.laya_report import render_html, render_markdown
 
@@ -41,6 +42,7 @@ class LayaReportWorker(QThread):
 
     ready = pyqtSignal(object)     # LayaReport
     failed = pyqtSignal(str)
+    progress = pyqtSignal(int, str)  # 真实加载/推理阶段进度
 
     def __init__(self, frame: Any, settings: Any, parent: Any = None) -> None:
         super().__init__(parent)
@@ -49,11 +51,15 @@ class LayaReportWorker(QThread):
 
     def run(self) -> None:
         try:
-            report = generate_report(self._frame, self._settings)
+            report = generate_report(self._frame, self._settings, progress=self._on_progress)
             self.ready.emit(report)
         except Exception as exc:  # noqa: BLE001
             logger.warning("LayaReportWorker failed: %s", exc)
             self.failed.emit(str(exc))
+
+    def _on_progress(self, pct: int, msg: str) -> None:
+        # 可能从 worker 内部线程发出；Qt 信号跨线程安全
+        self.progress.emit(int(pct), str(msg))
 
 
 class LayaReportDialog(QDialog):
@@ -79,7 +85,7 @@ class LayaReportDialog(QDialog):
         self._status.setWordWrap(True)
         root.addWidget(self._status)
 
-        # 进度条（模拟加载进度，给用户视觉反馈）
+        # 进度条：显示**真实**阶段进度（由 LayaEngine/推理回调驱动）
         self._progress = QProgressBar()
         self._progress.setRange(0, 100)
         self._progress.setValue(0)
@@ -87,10 +93,11 @@ class LayaReportDialog(QDialog):
         self._progress.setFormat("加载中... %p%")
         root.addWidget(self._progress)
 
-        # 定时器模拟进度更新（实际加载是阻塞的，这里给个心理安慰）
+        # 计时器：只更新「已等待 Ns」，不再伪造进度百分比
+        self._elapsed_s = 0.0
         self._progress_timer = QTimer(self)
-        self._progress_timer.timeout.connect(self._update_progress_simulated)
-        self._progress_timer.start(500)  # 每 0.5 秒更新一次
+        self._progress_timer.timeout.connect(self._tick_elapsed)
+        self._progress_timer.start(1000)
 
         self._view = QTextBrowser()
         self._view.setOpenExternalLinks(True)
@@ -143,8 +150,27 @@ class LayaReportDialog(QDialog):
         self._worker = LayaReportWorker(self._frame, self._settings, parent=self)
         self._worker.ready.connect(self._on_ready)
         self._worker.failed.connect(self._on_failed)
+        self._worker.progress.connect(self._on_progress)
+        self._progress.setVisible(True)
+        self._progress.setValue(0)
+        self._elapsed_s = 0.0
+        self._progress_timer.start(1000)
         self._refresh_btn.setEnabled(False)
         self._worker.start()
+
+    def _tick_elapsed(self) -> None:
+        """每秒更新等待秒数——真实反馈，不参与进度计算。"""
+        self._elapsed_s += 1.0
+        cur = self._progress.value()
+        self._status.setText(f"Laya 分析中…（已等待 {self._elapsed_s:.0f} 秒，当前阶段 {cur}%）")
+
+    def _on_progress(self, pct: int, msg: str) -> None:
+        """真实阶段进度：只在阶段推进时更新，避免高频重绘。"""
+        pct = max(0, min(100, int(pct)))
+        if pct > self._progress.value():
+            self._progress.setValue(pct)
+            self._progress.setFormat(f"{msg} %p%")
+        self._status.setText(f"Laya 分析中… {msg}")
 
     def _refresh_with_latest(self) -> None:
         """用主窗口当前最新数据重建帧并重新推理。"""
@@ -179,12 +205,8 @@ class LayaReportDialog(QDialog):
         self._worker = None
 
     def _update_progress_simulated(self) -> None:
-        """模拟进度条增长（实际加载是阻塞的，这里给用户视觉反馈）。"""
-        cur = self._progress.value()
-        if cur < 90:
-            # 前 90% 快速爬升，最后 10% 等真实结果
-            self._progress.setValue(cur + 5)
-        self._status.setText(f"正在加载 Laya 权重并推理…（已等待 {cur}%）")
+        """已废弃：改用真实阶段进度（见 _on_progress）。保留空实现以防旧调用。"""
+        return
 
     def _on_failed(self, msg: str) -> None:
         self._progress_timer.stop()
@@ -283,20 +305,32 @@ class LayaReportDialog(QDialog):
 
         for qid, qspec in questions.items():
             row = QHBoxLayout()
-            label = QLabel(qspec["question"][:30])  # 截断长问题
-            label.setToolTip(qspec["question"])
+            # 注意：schema 里的键是 instructions / criteria，不是 question / options
+            text = str(qspec.get("instructions") or qspec.get("question") or qid)
+            label = QLabel(text[:30])  # 截断长问题
+            label.setToolTip(text)
             combo = QComboBox()
-            options = qspec.get("options", [])
             if qspec["type"] == "noul":
                 options = ["有效", "无效"]
             elif qspec["type"] == "score":
-                options = [f"{i}" for i in range(11)]
+                options = [str(i) for i in range(11)]
+            else:
+                # choice：criteria 是 {key: 中文标签}，用中文标签做选项，
+                # 保存时再映射回 key（见 _label_key_of）
+                options = [str(v) for v in (qspec.get("criteria") or {}).values()] or ["(无选项)"]
             combo.addItems(options)
             # 默认选中 Laya 给出的答案
             ans = answers.get(qid)
             if ans is not None:
                 val = str(ans.value) if hasattr(ans, "value") else str(ans)
                 idx = combo.findText(val)
+                if idx < 0 and qspec["type"] != "noul":
+                    # value 可能是 criteria 的 key，反查其中文标签
+                    crit = qspec.get("criteria") or {}
+                    for k, v in crit.items():
+                        if str(k) == val:
+                            idx = combo.findText(str(v))
+                            break
                 if idx >= 0:
                     combo.setCurrentIndex(idx)
             row.addWidget(label)
@@ -304,17 +338,25 @@ class LayaReportDialog(QDialog):
             self._label_widgets[qid] = combo
             self._label_panel.layout().addLayout(row)
 
+    def _label_key_of(self, qid: str, text: str) -> str:
+        """把下拉框里的中文标签映射回 criteria 的 key（noul 除外）。"""
+        qspec = build_questions().get(qid, {})
+        if qspec.get("type") == "choice":
+            for k, v in (qspec.get("criteria") or {}).items():
+                if str(v) == text:
+                    return k
+        return text
+
     def _save_labels(self) -> None:
         """把用户标注写入 JSONL 文件。"""
         if not self._report:
             return
         from pa_agent.ai.laya_annotation import append_sample
-        from pa_agent.ai.laya_schema import build_questions
 
         questions = build_questions()
         labels: dict[str, str] = {}
         for qid, combo in self._label_widgets.items():
-            labels[qid] = combo.currentText()
+            labels[qid] = self._label_key_of(qid, combo.currentText())
 
         try:
             append_sample(

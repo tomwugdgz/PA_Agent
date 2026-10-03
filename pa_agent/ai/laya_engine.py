@@ -40,6 +40,16 @@ def _prepare_offline_env() -> None:
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 
+def _emit(progress: Any, pct: int, msg: str) -> None:
+    """安全调用进度回调：回调缺失或抛异常都不影响主流程。"""
+    if progress is None:
+        return
+    try:
+        progress(int(pct), str(msg))
+    except Exception:  # noqa: BLE001
+        logger.debug("progress 回调失败", exc_info=True)
+
+
 def check_runtime() -> str | None:
     """预检：返回 None 表示可用，否则返回**面向用户**的失败原因。"""
     _prepare_offline_env()
@@ -116,21 +126,33 @@ class LayaEngine:
 
     # ── 加载 ─────────────────────────────────────────────────────────────────
 
-    def ensure_loaded(self) -> Any:
+    def ensure_loaded(self, progress: Any = None) -> Any:
         """加载权重并返回 Agent。线程安全、幂等。
+
+        参数
+        ----
+        progress
+            可选回调 ``progress(pct: int, msg: str)``，用于把加载阶段的真实
+            进度回报给上层（GUI 进度条）。分三段：
+            5%（环境检查）→ 20%（权重校验/读盘）→ 80%（模型构建完成），
+            之后调用方推理到 95%、出报告 100%。已加载时直接回 100%。
 
         Raises:
             LayaUnavailable: 库缺失 / 权重缺失 / 加载失败（message 可直接展示）。
         """
         if self._agent is not None:
+            _emit(progress, 100, "Laya 权重已就绪")
             return self._agent
         with self._infer_lock:
             if self._agent is not None:
+                _emit(progress, 100, "Laya 权重已就绪")
                 return self._agent
 
+            _emit(progress, 5, "检查 Laya 运行时…")
             reason = check_runtime()
             if reason:
                 raise LayaUnavailable(reason)
+            _emit(progress, 20, "校验权重文件…")
             reason = check_weights(self.model_dir, self.subfolder)
             if reason:
                 raise LayaUnavailable(reason)
@@ -154,6 +176,10 @@ class LayaEngine:
                 raise LayaUnavailable(f"Laya 权重加载失败：{type(exc).__name__}: {exc}") from exc
             self.load_ms = (time.perf_counter() - t0) * 1000
             self.device = str(getattr(agent, "device", ""))
+            _emit(
+                progress, 80,
+                f"权重加载完成（{self.load_ms / 1000:.1f}s，设备 {self.device or '?'}）",
+            )
             logger.info(
                 "Laya loaded in %.1fs (device=%s, dir=%s/%s)",
                 self.load_ms / 1000,

@@ -100,8 +100,13 @@ def questions_kind(qid: str) -> str | None:
     return None
 
 
-def generate_report(frame: Any, settings: Any) -> LayaReport:
+def generate_report(frame: Any, settings: Any, progress: Any = None) -> LayaReport:
     """从一帧 K 线生成完整 Laya 报告。
+
+    参数
+    ----
+    progress
+        可选回调 ``progress(pct, msg)``，GUI 用来显示**真实**加载/推理进度。
 
     Raises:
         LayaUnavailable: 运行时 / 权重 / 推理失败（message 可直接展示给用户）。
@@ -122,6 +127,12 @@ def generate_report(frame: Any, settings: Any) -> LayaReport:
         except (TypeError, ValueError):
             atr = None
 
+    if progress is not None:
+        try:
+            progress(3, f"准备 {len(bars)} 根 K 线特征…")
+        except Exception:  # noqa: BLE001
+            pass
+
     features = compute_simple_market_features(frame)
 
     engine = LayaEngine.get(
@@ -129,8 +140,14 @@ def generate_report(frame: Any, settings: Any) -> LayaReport:
         subfolder=cfg.subfolder,
         device=_resolve_device(cfg),
     )
-    agent = engine.ensure_loaded()  # 校验 + 加载（幂等）
+    agent = engine.ensure_loaded(progress=progress)  # 校验 + 加载（幂等）
     del agent
+
+    if progress is not None:
+        try:
+            progress(85, "构造问题与状态…")
+        except Exception:  # noqa: BLE001
+            pass
 
     questions = build_questions()
     state = build_state(
@@ -142,6 +159,11 @@ def generate_report(frame: Any, settings: Any) -> LayaReport:
     )
 
     t0 = time.perf_counter()
+    if progress is not None:
+        try:
+            progress(90, f"推理中（{len(questions)} 个问题）…")
+        except Exception:  # noqa: BLE001
+            pass
     raw = engine.predict(state, questions, lang="zh")
     latency_ms = (time.perf_counter() - t0) * 1000
 
@@ -211,6 +233,11 @@ def generate_report(frame: Any, settings: Any) -> LayaReport:
                     n_errors=len(errors))
     # ── 最近一次报告落盘（供 MT5 面板「导入分析」读取；失败静默）
     _persist_latest(report)
+    if progress is not None:
+        try:
+            progress(100, "报告完成")
+        except Exception:  # noqa: BLE001
+            pass
     return report
 
 

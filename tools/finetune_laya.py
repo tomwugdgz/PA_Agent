@@ -55,33 +55,50 @@ def convert_to_laya_format(samples: list[dict[str, Any]]) -> list[dict[str, Any]
 
         {
           "state": "...",           # 字符串或 dict
-          "questions": {...},       # qid → {type, question, options}
-          "expected_answers": {...} # qid → 正确答案（与 label 对齐）
+          "questions": {...},       # qid → {type, instructions, criteria}
+          "expected_answers": {...} # qid → 正确答案
         }
+
+    注意：``laya_schema.build_questions()`` 用的是 ``criteria``（{key: 中文标签}），
+    **不是** ``options``（有序列表）。早期版本按 options.index() 映射，会全部兜底成 0
+    ——那等于把"周期结构=急速尖峰"教成"周期结构=第一个选项"。这里按 criteria 的
+    key 顺序取索引，两种结构都兼容。
     """
     dataset: list[dict[str, Any]] = []
     for s in samples:
-        labels = s["label"]  # dict[qid, correct_answer]
-        # 把 label 里的中文答案映射回 Laya 选项索引
+        labels = s.get("label") or {}
+        qs = s.get("questions") or {}
+        # qid → {key: 中文标签}
         expected: dict[str, Any] = {}
         for qid, correct in labels.items():
-            qspec = s["questions"].get(qid, {})
-            options = qspec.get("options", [])
-            if qspec.get("type") == "noul":
-                # noul 问题：label 是"有效"/"无效"，转成 0/1
-                expected[qid] = 1 if correct == "有效" else 0
-            elif qspec.get("type") == "choice":
-                # choice 问题：找正确选项在 options 中的索引
-                try:
-                    idx = options.index(correct)
-                    expected[qid] = idx
-                except ValueError:
-                    expected[qid] = 0  # 兜底
+            qspec = qs.get(qid, {})
+            qtype = qspec.get("type")
+            if qtype == "noul":
+                # noul：label 是 "有效"/"无效"（或已转成 0/1）
+                if isinstance(correct, (int, float)):
+                    expected[qid] = int(correct)
+                else:
+                    expected[qid] = 1 if str(correct) == "有效" else 0
+            elif qtype == "choice":
+                crit = qspec.get("criteria") or {}
+                if crit:
+                    keys = list(crit.keys())           # 顺序即选项顺序
+                    labels_map = {str(v): k for k, v in crit.items()}
+                    key = labels_map.get(str(correct), correct)
+                    expected[qid] = keys.index(key) if key in keys else 0
+                else:
+                    opts = qspec.get("options") or []  # 兼容旧结构
+                    try:
+                        expected[qid] = opts.index(correct)
+                    except ValueError:
+                        expected[qid] = 0
             else:
                 expected[qid] = correct
+        if not expected:
+            continue
         dataset.append({
-            "state": s["state"],
-            "questions": s["questions"],
+            "state": s.get("state"),
+            "questions": qs,
             "expected_answers": expected,
         })
     return dataset
@@ -168,8 +185,9 @@ def main() -> None:
         sys.exit(1)
     print(f"[OK] {msg}")
 
-    # 2. 加载已标注样本
-    data_dir = args.data_dir or (Path.home() / "PA_Agent" / "experience" / "laya_annotations")
+    # 2. 加载已标注样本（默认仓库内 experience/laya_annotations/）
+    repo_root = Path(__file__).resolve().parent.parent
+    data_dir = args.data_dir or (repo_root / "experience" / "laya_annotations")
     if not data_dir.is_dir():
         print(f"[错误] 数据目录不存在：{data_dir}", file=sys.stderr)
         sys.exit(1)
@@ -177,6 +195,8 @@ def main() -> None:
     samples = load_labeled_samples(data_dir)
     labeled = [s for s in samples if s.get("label")]
     print(f"[数据] 总样本 {len(samples)} 条，已标注 {len(labeled)} 条")
+    if not labeled:
+        print("[提示] 还没有已标注样本。打开 Laya 报告 →「进入标注模式」逐题打标签即可积累。")
 
     if len(labeled) < 10:
         print("[警告] 已标注样本不足 10 条，微调极易过拟合。建议先积累数据。")

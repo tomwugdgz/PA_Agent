@@ -225,6 +225,36 @@ def _filling_name(v: int) -> str:
     return {0: "FOK", 1: "IOC", 2: "RETURN"}.get(v, str(v))
 
 
+def _count_same_side(symbol: str, direction: str, magic: int) -> int:
+    """统计本程序在 ``symbol`` 上同方向的持仓 + 挂单笔数。
+
+    只数 magic 匹配的单（不碰用户手工单）。取不到数据时返回 0（放行），
+    宁可少拦也不要在行情接口异常时挡住正常下单。
+    """
+    import MetaTrader5 as mt5
+
+    want = 0 if direction == "long" else 1   # POSITION_TYPE_BUY / SELL
+    n = 0
+    try:
+        for p in (mt5.positions_get(symbol=symbol) or ()):
+            if int(getattr(p, "magic", 0)) != int(magic):
+                continue
+            if int(getattr(p, "type", -1)) == want:
+                n += 1
+    except Exception:  # noqa: BLE001
+        logger.debug("positions_get 失败，跳过重复持仓检查", exc_info=True)
+        return 0
+    try:
+        for o in (mt5.orders_get(symbol=symbol) or ()):
+            if int(getattr(o, "magic", 0)) != int(magic):
+                continue
+            if int(getattr(o, "type", -1)) == want:
+                n += 1
+    except Exception:  # noqa: BLE001
+        logger.debug("orders_get 失败，只按持仓计数", exc_info=True)
+    return n
+
+
 def _send_order_impl(req: OrderRequest, *, cfg: Any) -> OrderResult:
     """执行一次下单。最后一道机器校验在此完成。
 
@@ -243,6 +273,23 @@ def _send_order_impl(req: OrderRequest, *, cfg: Any) -> OrderResult:
                 False, None, None,
                 f"点差 {sym.spread_points} 超过上限 {cfg.max_spread_points} point，拒绝下单",
             )
+
+        # ── 同品种同方向重复持仓拦截（防连开） ────────────────────────────
+        max_pos = int(getattr(cfg, "max_same_symbol_positions", 0) or 0)
+        if max_pos > 0:
+            try:
+                held = _count_same_side(req.symbol, req.direction, cfg.magic)
+            except Exception:  # noqa: BLE001
+                held = 0
+            if held >= max_pos:
+                side = "多单" if req.direction == "long" else "空单"
+                return OrderResult(
+                    False, None, None,
+                    f"已有 {held} 笔 {req.symbol} {side}（本程序 magic={cfg.magic}），"
+                    f"达到上限 {max_pos}，拒绝重复开仓。"
+                    f"如需加仓请先在 MT5 中手动平掉一笔，或把配置项 "
+                    f"mt5trading.max_same_symbol_positions 调大。",
+                )
 
         lot = normalize_lot(req.lot, sym)
         tick = mt5.symbol_info_tick(req.symbol)
