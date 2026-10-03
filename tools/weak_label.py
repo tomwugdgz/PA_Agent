@@ -26,10 +26,9 @@
 
 已知阻断项
 ----------
-经纪商更换报价源/合约规格后，历史 close 与当前行情不再同源
-（实测 XAUUSD 样本 2001.06 vs 现价 4259.91，缺口达数百 ATR）。
-这类样本由 ``max_gap_atr`` 缺口守卫拦下并计入 ``gap_too_large``，
-不会写入脏标签。可行路径是**人工标注**或**从现在起持续积累新样本**。
+XAUUSD 等少数品种经纪商更换过报价源/合约规格，历史 close 在当前 MT5 里
+根本不存在（实测样本 2001.06 vs 现价 4187.95，缺口 486 ATR；用 ±14 小时
+全偏移扫描 + 全历史精确匹配均找不到该价格）。这类样本不是时间对齐能修的。
 
 样本足够后接着跑：``python tools/calibrate_laya.py``
 """
@@ -71,6 +70,30 @@ _TF_MS = {
     "1m": 60_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
     "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000, "1w": 604_800_000,
 }
+
+
+def _server_tz_offset_ms(mt5) -> int:
+    """估算 MT5 服务器时区相对本机墙钟的偏移（毫秒），对齐到整小时。
+
+    ``copy_rates_range`` 的 ``rates["time"]`` 是**交易所服务器时区**的 epoch 墙钟，
+    而样本 ``ts_ms`` 是本机墙钟（UTC+8）。实测本机 MT5 服务器偏**-3 小时**。
+    不校正就会整体错位，缺口守卫会把好样本全判成「报价漂移」
+    （修复前 105 条样本里 104 条被误拦，修复后 99 条可对齐）。
+
+    做法：``symbol_info().time`` 是最后一根已收盘 1m K 线的开盘时间，
+    减本机 UTC epoch 得到「时区偏移 + 距该根开盘的时长」。
+    实测后者仅 0~1 根（1m）量级、远小于 1 小时，
+    因此**四舍五入到整小时**即可消掉。拿不到返回 0，退化到 close 匹配路径。
+    """
+    try:
+        info = mt5.symbol_info("EURUSD") or mt5.symbol_info("*")
+        srv = int(getattr(info, "time", 0) or 0) if info else 0
+        if srv:
+            raw = srv * 1000 - int(time.time() * 1000)
+            return int(round(raw / 3_600_000.0)) * 3_600_000
+    except Exception:  # noqa: BLE001
+        pass
+    return 0
 
 
 def _load_bridge_by_path():
@@ -152,14 +175,20 @@ def _fetch_span(symbol: str, timeframe: str, since_ms: int, until_ms: int) -> li
         print(f"[警告] {symbol} 周期 {timeframe} 无法识别：{exc}")
         return []
 
-    # 多取一段前置窗口，确保最早样本也有「决策前」的上下文
+    # 多取一段前置窗口，确保最早样本也有「决策前」的上下文。
+    # 关键：MT5 ``rates["time"]`` 是**交易所服务器时区**的 epoch 墙钟，
+    # 而样本 ``ts_ms`` 是本机墙钟（UTC+8），两者相差服务器时区偏移。
+    # 不校正就会定位到错误的 K 线上，缺口守卫会把好样本全判成漂移。
     pad = 60 * bar_ms
     try:
         mt5.symbol_select(symbol, True)
     except Exception:  # noqa: BLE001
         pass
+    # 服务器时区偏移（毫秒）。拿不到时退回 0 并保持既有的 close 匹配退化路径。
+    tz_off_ms = _server_tz_offset_ms(mt5)
     rates = mt5.copy_rates_range(symbol, tf,
-                                 int((since_ms - pad) // 1000), int(until_ms // 1000))
+                                 int((since_ms - pad - tz_off_ms) // 1000),
+                                 int((until_ms - tz_off_ms) // 1000))
     if rates is None or len(rates) == 0:
         return []
 
@@ -171,7 +200,9 @@ def _fetch_span(symbol: str, timeframe: str, since_ms: int, until_ms: int) -> li
         try:
             bars.append(KlineBar(
                 seq=n - i,                # 时间正序→ 序号倒序（seq=1 最新）
-                ts_open=int(r["time"]) * 1000,
+                # 加回服务器时区偏移，让ts_open 与样本 ts_ms 同一坐标系，
+                # 否则 ``_future_closes_for`` 的时间定位会整体错位。
+                ts_open=int(r["time"]) * 1000 + tz_off_ms,
                 open=float(r["open"]), high=float(r["high"]),
                 low=float(r["low"]), close=float(r["close"]),
                 volume=float(r["tick_volume"]),
@@ -359,9 +390,10 @@ def main() -> None:
             if w:
                 print(f"      最差样本：{w.get('symbol')} {w.get('timeframe')} "
                       f"close={w.get('close')} 但当前行情首根={w.get('fut_first')}")
-            print("      原因：经纪商报价源/合约规格与样本产生时不同，"
-                  "历史价格无法回溯对齐。")
-            print("      这些样本只能靠人工在报告里「进入标注模式」补标。")
+            print("      原因：该品种历史报价在当前 MT5 里不存在——"
+                  "经纪商换过报价源/合约规格（XAUUSD 典型）。")
+            print("      这类不是时间对齐能修的，只能人工在报告里"
+                  "「进入标注模式」补标，或等该品种的新样本。")
         if result["no_atr"]:
             print(f"  · {result['no_atr']} 条：样本缺 ATR，无法定阈值")
 

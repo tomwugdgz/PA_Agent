@@ -92,12 +92,12 @@ def infer_labels(
         atr_mult: 净涨跌需超过 ``atr_mult * atr`` 才算有方向。
         max_gap_atr: ``future[0]`` 与 ``close`` 的最大允许缺口（单位 ATR）。
             超过说明 K 线窗口没对齐到决策时刻，返回 None。
+            短周期需放宽（1m 约 6、5m 约 4），调用方按周期传入。
 
-    ⚠️ 已知阻断项：经纪商更换报价源 / 合约规格后，**历史样本的close 与
-    当前 MT5 返回的 K 线不再同源**（实测 XAUUSD 样本 2001 vs 现价 4259、
-    USDJPY 158.31 vs 157.4，缺口高达数百 ATR）。这类样本一律被缺口守卫
-    丢弃——宁可不标，也不能用错位的行情教模型。只有样本产生之后、同一
-    报价环境下持续积累的样本才能被标注。
+    ⚠️ 剩余阻断项：XAUUSD 等少数品种经纪商更换过报价源 / 合约规格，
+    历史 ``close`` 在当前 MT5 里**根本不存在**（实测样本 2001.06 vs 现价 4187.95，
+    缺口 486 ATR；用 ±14 小时全偏移扫描 + 全历史精确匹配均找不到该价格）。
+    这类样本不是时间对齐能修的，只能人工标注或等新样本。
     """
     if not future or len(future) < 2:
         return None
@@ -151,10 +151,21 @@ def _future_closes_for(sample: dict[str, Any],
                        bars_by_key: dict[tuple[str, str], list[tuple[int, float]]],
                        *,
                        lookahead: int = 20,
+                       anchor_tol_atr: float = 2.0,
+                       atr: float | None = None,
                        ) -> list[float]:
     """从 K 线库取出该样本决策时点**之后**的收盘价（时间正序）。
 
-    定位优先用 ``ts_ms``（样本里存了决策时刻）；退化时用 ``close`` 找最近匹配。
+    定位分两级：
+    1. **时间定位**：用 ``ts_ms`` 找到样本决策时刻所在/紧邻的那根；
+    2. **价格校验**：样本 ``close`` 取自**已收盘的上一根**（不是决策时刻的实时价），
+       所以时间上定位到的那根未必价格吻合。实测两者可差 1~2 根。
+       因此在时间定位点附近小范围回退，直到 ``close`` 对得上（或退无可退）。
+
+    ``anchor_tol_atr`` 是价格**回退匹配**的容差（单位 ATR），传 ``atr`` 才生效；
+    不传则退化为按价格相对误差（1e-5）判断。精确匹配（相对误差 1e-9）不受它影响。
+    短周期需要更宽的容差：实测 1m 品种相邻根价差可达 4~5 ATR（噪音远大于 15m+），
+    故按周期自适应放大。
     ``lookahead`` 限制窗口长度：只看最近 N 根，太多会把信号稀释成长期趋势。
     """
     ctx = sample.get("context") or {}
@@ -164,34 +175,98 @@ def _future_closes_for(sample: dict[str, Any],
     if not series:
         return []
 
+    # 短周期噪音大，价格锚点要放宽（实测中位缺口：1m 约 4 ATR，15m 约 0 ATR）
+    tf_tol_mult = {"1m": 6.0, "5m": 4.0}.get(tf, anchor_tol_atr)
+
+    close = ctx.get("close")
+    try:
+        pivot = float(close) if close is not None else None
+    except (TypeError, ValueError):
+        pivot = None
+    if pivot is not None and pivot <= 0:
+        pivot = None
+
+    # 价格容差：优先用 ATR 相对容差，缺失时退回价格相对误差
+    tol: float | None = None
+    if atr:
+        try:
+            a = float(atr)
+            if a > 0:
+                tol = a * max(0.05, tf_tol_mult)
+        except (TypeError, ValueError):
+            tol = None
+    if tol is None and pivot is not None:
+        tol = max(1e-9, abs(pivot) * 1e-5)
+
+    def _close_enough(value: float) -> bool:
+        return tol is not None and pivot is not None and abs(value - pivot) <= tol
+
     ts = sample.get("ts_ms")
+    anchor = -1
     if ts is not None:
         try:
             cut = int(ts)
-            # 样本 ts_ms 是**推理时刻**，落在当根 K 线之内（ts_open <= cut < 下一根）。
-            # 因此「未来」= ts_open 严格大于当根开盘的那些根，即 t > cut - 一根周期。
             bar_ms = _tf_ms(tf)
-            fut = [c for t, c in series if t > cut - bar_ms]
-            if len(fut) >= 2:
-                return fut[-lookahead:]
+            # 决策时刻落在「当根已收盘 K 线」之内（ts_open <= cut < 下一根开盘）
+            pos = 0
+            for i, (t, _c) in enumerate(series):
+                if t <= cut:
+                    pos = i
+                else:
+                    break
+
+            # 价格锚点分两阶段，**顺序不能反**：
+            # 1) 先在时间锚点附近找**精确匹配**（相对误差 1e-9）。
+            #    样本 close 来自已收盘 K 线，与时间锚点可差 1~5 根（实测 -5 根命中）。
+            # 2) 精确匹配找不到，才退回 ATR 容差匹配。
+            # 反过来会出错：ATR 容差（如 2×ATR）往往比相邻根的价差还宽，
+            # 会把时间锚点本身误判为命中，从而取到错误位置的未来序列
+            #（实测导致 |fut[0]-close| = 2.42 ATR，被缺口守卫全判为漂移）。
+            if pivot is not None:
+                exact_tol = max(1e-9, abs(pivot) * 1e-9)
+                for delta in range(0, 9):
+                    hit = -1
+                    for cand in ((pos,) if delta == 0 else (pos - delta, pos + delta)):
+                        if 0 <= cand < len(series) and abs(series[cand][1] - pivot) <= exact_tol:
+                            hit = cand
+                            break
+                    if hit >= 0:
+                        anchor = hit
+                        break
+            if anchor < 0 and tol is not None and pivot is not None:
+                for delta in range(0, 9):
+                    hit = -1
+                    for cand in ((pos,) if delta == 0 else (pos - delta, pos + delta)):
+                        if 0 <= cand < len(series) and _close_enough(series[cand][1]):
+                            hit = cand
+                            break
+                    if hit >= 0:
+                        anchor = hit
+                        break
+            if anchor < 0:
+                # 没找到价格吻合点：退回纯时间锚点（让下游缺口守卫去判）
+                anchor = pos
+            if anchor + 1 < len(series) and bar_ms > 0:
+                # 必须从锚点**紧接**往后取 lookahead 根，不能用 [-lookahead:]。
+                # 后者从序列末尾截断：若锚点之后还有 100+ 根（样本太老、窗口很大），
+                # 会跳过紧邻的走势、把「未来」错取到很远的位置，
+                # 实测导致 |fut[0]-close| 高达 2.42 ATR 而被缺口守卫全判为漂移。
+                tail = [c for _t, c in series[anchor + 1:]]
+                return tail[:lookahead] if len(tail) > lookahead else tail
         except (TypeError, ValueError):
             pass
 
-    close = ctx.get("close")
-    if close is None:
+    if pivot is None:
         return []
-    try:
-        pivot = float(close)
-    except (TypeError, ValueError):
-        return []
-    # 退化路径：找最后一个收盘价 ≈ pivot 的位置，取其后的一段
+    # 退化路径：找最后一个收盘价≈ pivot 的位置，取其后的一段
     last = -1
-    for i, (_, c) in enumerate(series):
+    for i, (_t, c) in enumerate(series):
         if abs(c - pivot) <= max(1e-9, abs(pivot) * 1e-6):
             last = i
     if last < 0 or last + 2 >= len(series):
         return []
-    return [c for _, c in series[last + 1:]][-lookahead:]
+    tail = [c for _t, c in series[last + 1:]]
+    return tail[:lookahead] if len(tail) > lookahead else tail
 
 
 def build_bar_index(frames: list[Any], *, horizon: int = 0) -> dict[tuple[str, str], list[tuple[int, float]]]:
@@ -312,13 +387,17 @@ def relabel_unlabeled(
                 result["already"] += 1
                 continue
             ctx = s.get("context") or {}
-            fut = _future_closes_for(s, bar_index)
+            # 缺口守卫的阈值要跟锚点容差同源：1m 品种相邻根价差可达 4~5 ATR，
+            # 用统一 1.5 ATR 会把已对齐的样本也误判为漂移。
+            tfm = str(ctx.get("timeframe") or "")
+            gap_mult = max(max_gap_atr, {"1m": 6.0, "5m": 4.0}.get(tfm, max_gap_atr))
+            fut = _future_closes_for(s, bar_index, atr=ctx.get("atr"))
             labels = infer_labels(
                 close=ctx.get("close"),
                 atr=ctx.get("atr"),
                 future=fut,
                 atr_mult=atr_mult,
-                max_gap_atr=max_gap_atr,
+                max_gap_atr=gap_mult,
             )
             if not labels:
                 result["undecidable"] += 1

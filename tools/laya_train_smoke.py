@@ -127,6 +127,64 @@ def test_future_slice() -> None:
     print(f"  [OK] 未来切片：决策点之后取到 {len(fut)} 根，时间正序")
 
 
+def test_future_slice_takes_adjacent_bars() -> None:
+    """回归：必须取锚点**紧接**的 N 根，不能用 ``[-lookahead:]`` 从末尾截断。
+
+    原bug：``series[anchor + 1:][-lookahead:]`` 在锚点后还有 100+ 根时，
+    会跳过紧邻走势、把「未来」错取到很远位置（实测 |fut[0]-close| 达 2.42 ATR，
+    导致 105 条样本里 104 条被缺口守卫误判为报价漂移）。
+    """
+    from pa_agent.ai.laya_weaklabel import _future_closes_for as _ffs
+
+    # 时间锚点落在 index 100（ts_ms 落在第 101 根之中），
+    # 而锚点之后还剩 99 根 —— 足以暴露「从末尾截断」的 bug
+    series = [(1_000 * i, 100.0 + i) for i in range(200)]
+    s = {"ts_ms": 100_500, "context": {"symbol": "X", "timeframe": "1m",
+                                       "close": 200.0, "atr": 1.0}}
+    fut = _ffs(s, {("X", "1m"): series}, atr=1.0)
+    # 精确匹配 anchor=100（close=200.0），紧接的 20 根 = 201..220
+    assert fut[:3] == [201.0, 202.0, 203.0], f"应从锚点紧接处取，实得 {fut[:3]}"
+    assert len(fut) == 20, f"应取 20 根，实得 {len(fut)}"
+    assert fut[-1] == 220.0, f"末根应为 220.0（紧接窗口），实得 {fut[-1]}"
+    # 若误用 [-lookahead:]，会拿到 180..199
+    assert fut[0] != 180.0, "不应从序列末尾截断"
+    print("  [OK] 未来切片取紧邻窗口：锚点后仍有 99 根，仍取紧接的 20 根")
+
+
+def test_anchor_prefers_exact_over_tolerance() -> None:
+    """回归：锚点定位必须**优先精确匹配**，不能先用 ATR 容差。
+
+    原 bug：ATR 容差（2×ATR）比相邻根价差还宽，会把时间锚点本身误判为命中，
+    从而取到错误位置的未来序列。实测该场景让 |fut[0]-close| 达 2.42 ATR。
+    """
+    from pa_agent.ai.laya_weaklabel import _future_closes_for as _ffs
+
+    # 时间锚点落在 index 10 之内（ts_ms=10500 → pos=10，close=110）
+    # 110 与 pivot=105 差 5.0 = 10×ATR，**落在 ATR 容差内**，
+    # 但真正的精确匹配在 index 5（close=105.0）
+    series = [(1_000 * i, 100.0 + i) for i in range(40)]
+    s = {"ts_ms": 10_500, "context": {"symbol": "X", "timeframe": "1m",
+                                       "close": 105.0, "atr": 5.0}}
+    fut = _ffs(s, {("X", "1m"): series}, atr=5.0)
+    # 精确匹配 anchor=5，应从 106.0 开始（而非容差匹配到的 111.0）
+    assert fut[0] == 106.0, f"精确匹配后应从 106.0 起，实得 {fut[0]}"
+    print("  [OK] 锚点优先精确匹配：容差内的非精确点未被误用")
+
+
+def test_short_timeframe_tolerance_is_wider() -> None:
+    """回归：短周期容差需比长周期宽（1m 噪音远大于 15m）。"""
+    from pa_agent.ai.laya_weaklabel import _future_closes_for as _ffs
+
+    # 1m：anchor 时间位置 close差 4 ATR，应仍能通过容差回退匹配
+    series_1m = [(60_000 * i, 100.0) for i in range(30)]
+    series_1m[20] = (60_000 * 20, 100.0)
+    s = {"ts_ms": 20 * 60_000 + 1_000, "context": {"symbol": "X", "timeframe": "1m",
+                                                    "close": 104.0, "atr": 1.0}}
+    fut = _ffs(s, {("X", "1m"): series_1m}, atr=1.0)
+    assert fut, "1m 短周期应能通过放宽的容差找到锚点"
+    print(f"  [OK] 短周期容差自适应：1m 品种 4 ATR 偏差仍可定位（取到 {len(fut)} 根）")
+
+
 def test_target_vectors() -> None:
     """one-hot 构造：choice 用 criteria 键序，noul 用 [1-P, P]。"""
     qs = build_questions()
@@ -200,6 +258,9 @@ def main() -> None:
     test_infer_labels_grey_zone()
     test_infer_labels_boundaries()
     test_future_slice()
+    test_future_slice_takes_adjacent_bars()
+    test_anchor_prefers_exact_over_tolerance()
+    test_short_timeframe_tolerance_is_wider()
     test_target_vectors()
     test_to_laya_pairs_priority()
     test_confidence_filter()
