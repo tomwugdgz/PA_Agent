@@ -15,12 +15,15 @@ from __future__ import annotations
 
 import html
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from pa_agent.ai.laya_schema import LayaPrediction
 from pa_agent.report.laya_pricing import PricePlan
+
+logger = logging.getLogger(__name__)
 
 _DIRECTION_ZH = {"bullish": "偏多", "bearish": "偏空", "neutral": "中性"}
 _ACT_ZH = {"long": "买入", "short": "卖出"}
@@ -390,6 +393,8 @@ _HTML_TMPL = """<!DOCTYPE html>
 
 {trust_html}
 
+{memory_html}
+
 <h2>结论</h2>
 <div class="card">
   <div class="big">{direction_zh}</div>
@@ -597,6 +602,94 @@ def _mt5_action_card(r: LayaReport) -> str:
     return "".join(html_parts)
 
 
+def _memory_card(r: LayaReport) -> str:
+    """品种记忆卡片：本次均线快照 + 该品种历史命中率。
+
+    这是"记忆库"在报告里的唯一入口，目的只有两个：
+      1. 让人能确认**这份分析用的是哪一批数据**（均线快照随行情变）
+      2. 让人知道**这个品种的历史预测准不准**（命中率高才值得参考）
+    """
+    try:
+        from pa_agent.memory.settle import accuracy_hint
+        from pa_agent.memory.symbol_memory import load_profile, symbol_dir
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("记忆库卡片不可用: %s", exc)
+        return ""
+
+    # ── 本次均线快照（从state 之外拿不到，直接从画像读最近一次会话）──
+    mas_line = ""
+    try:
+        sess_path = symbol_dir(r.symbol, r.timeframe) / "sessions.jsonl"
+        if sess_path.is_file():
+            lines = [ln for ln in sess_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            if lines:
+                last = json.loads(lines[-1])
+                mas = last.get("mas") or {}
+                if mas:
+                    parts = []
+                    for p in (5, 10, 20, 60):
+                        v = mas.get(str(p))
+                        if v is not None:
+                            parts.append(f"MA{p} {float(v):.5f}")
+                    if parts:
+                        pat = last.get("ma_pattern", "unknown")
+                        pat_zh = {"bullish": "多头排列", "bearish": "空头排列",
+                                  "mixed": "交织"}.get(pat, pat)
+                        mas_line = (
+                            f'<div class="muted">均线快照（{pat_zh}）：'
+                            + "　".join(parts)
+                            + "</div>"
+                        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("均线快照读取失败: %s", exc)
+
+    # ── 历史命中率 ──
+    prof = load_profile(r.symbol, r.timeframe)
+    if not prof.n_sessions:
+        return ""
+    hint = accuracy_hint(r.symbol, r.timeframe)
+    acc = prof.direction_accuracy
+    if acc is None:
+        acc_html = "<span class='na'>暂无可统计的方向命中</span>"
+    elif acc >= 0.6:
+        acc_html = f"<b style='color:#1A9850'>{acc:.0%}</b>"
+    elif acc >= 0.45:
+        acc_html = f"<b style='color:#B45309'>{acc:.0%}</b>"
+    else:
+        acc_html = f"<b style='color:#D62728'>{acc:.0%}</b>"
+
+    extra = ""
+    if prof.atr_avg:
+        extra += f"<div class='muted'>历史平均 ATR {prof.atr_avg}</div>"
+    if prof.price_min is not None and prof.price_max is not None:
+        extra += f"<div class='muted'>历史价格区间 {prof.price_min} ~ {prof.price_max}</div>"
+    if prof.common_supports:
+        extra += (
+            "<div class='muted'>历史常见支撑 "
+            + "、".join(f"{v}" for v in prof.common_supports[:3])
+            + "</div>"
+        )
+    if prof.common_resistances:
+        extra += (
+            "<div class='muted'>历史常见阻力 "
+            + "、".join(f"{v}" for v in prof.common_resistances[:3])
+            + "</div>"
+        )
+
+    return (
+        f'<div class="card">'
+        f'<div class="muted">品种记忆库 · {html.escape(r.symbol)} {html.escape(r.timeframe)}</div>'
+        f'<div class="big">历史方向命中率 {acc_html}</div>'
+        f'<div class="muted">{html.escape(hint)}</div>'
+        f'{mas_line}{extra}'
+        f'<div class="muted" style="margin-top:6px">'
+        f"已积累 {prof.n_sessions} 次分析 / {prof.n_settled} 次有效结算，"
+        f"记录目录：experience/memory/{html.escape(r.symbol)}/{html.escape(r.timeframe)}/"
+        f"</div>"
+        f"</div>"
+    )
+
+
 def _confidence_trust_card(r: LayaReport) -> str:
     """置信度可信度卡片——明确告诉用户「这份结论该信到什么程度」。
 
@@ -713,6 +806,8 @@ def render_html(r: LayaReport) -> str:
     mt5_action_html = _mt5_action_card(r)
     # ── 置信度可信度卡片（明确该不该信） ────────────────────────────
     trust_html = _confidence_trust_card(r)
+    # ── 品种记忆库卡片（历史命中率 + 本次均线快照） ────────────────
+    memory_html = _memory_card(r)
     # ── 三分支交易判断（多/空/观望 + 复合概率） ─────────────────────
     branches_html = _branches_html(r)
 
@@ -726,6 +821,7 @@ def render_html(r: LayaReport) -> str:
         errors_html=errors_html,
         mt5_action_html=mt5_action_html,
         trust_html=trust_html,
+        memory_html=memory_html,
         branches_html=branches_html,
         direction_zh=direction_zh,
         direction_conf=(f"{dire.confidence * 100:.0f}%" if dire else "—"),

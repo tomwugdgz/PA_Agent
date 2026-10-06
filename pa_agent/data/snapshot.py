@@ -7,9 +7,14 @@ from pa_agent.data.bar_close_wait import has_forming_bar_at_head
 from pa_agent.data.base import IndicatorBundle, KlineBar, KlineFrame, normalize_kline_bar
 from pa_agent.util.timefmt import now_local_ms
 
-# Extra closed bars fetched before the AI window so EMA20/ATR14 can warm up.
+#: 简单均线周期。记忆库按品种存均线时也依赖这个列表，
+#: 改动会让历史记录里的均线口径前后不一致——要改需同时迁移旧数据。
+MA_PERIODS: tuple[int, ...] = (5, 10, 20, 60)
+
+# Extra closed bars fetched before the AI window so indicators can warm up.
 # Only the newest *n* bars are sent to the model; indicators use this buffer.
-INDICATOR_WARMUP_BARS = 50
+# 必须 >= max(MA_PERIODS) = 60，否则 MA60 全是 nan（预热不足）。
+INDICATOR_WARMUP_BARS = 70
 
 
 def frame_is_pure_closed(frame: KlineFrame) -> bool:
@@ -102,13 +107,17 @@ def _newest_closed_slice(
 
 
 def compute_indicators(bars: list[KlineBar]) -> IndicatorBundle:
-    """Compute EMA20 and ATR14 for *bars* (newest-first order).
+    """Compute EMA20, ATR14 and MA5/10/20/60 for *bars* (newest-first order).
 
     Indicators are computed on the reversed (oldest-first) sequence and then
     reversed back so that index *i* aligns with ``bars[i]`` (K1 at index 0).
+
+    MA 周期定义在 :data:`MA_PERIODS`，改动会同时影响所有调用方
+    （记忆库按品种存均线时也依赖这个列表）。
     """
     from pa_agent.indicators.ema import ema_full
     from pa_agent.indicators.atr import atr_full
+    from pa_agent.indicators.ma import ma_full
 
     # bars is newest-first; indicators need oldest-first input
     bars_asc = list(reversed(bars))
@@ -119,12 +128,14 @@ def compute_indicators(bars: list[KlineBar]) -> IndicatorBundle:
 
     ema20_asc = ema_full(closes, period=20)
     atr14_asc = atr_full(highs, lows, closes, period=14)
+    mas_asc = {p: ma_full(closes, p) for p in MA_PERIODS}
 
     # Reverse back to newest-first
     ema20 = tuple(reversed(ema20_asc))
     atr14 = tuple(reversed(atr14_asc))
+    mas = {p: tuple(reversed(seq)) for p, seq in mas_asc.items()}
 
-    return IndicatorBundle(ema20=ema20, atr14=atr14)
+    return IndicatorBundle(ema20=ema20, atr14=atr14, mas=mas)
 
 
 def build_display_frame(
@@ -261,6 +272,7 @@ def build_analysis_frame(
     indicators = IndicatorBundle(
         ema20=indicators_all.ema20[:n],
         atr14=indicators_all.atr14[:n],
+        mas={p: seq[:n] for p, seq in indicators_all.mas.items()},
     )
     return KlineFrame(
         symbol=symbol,

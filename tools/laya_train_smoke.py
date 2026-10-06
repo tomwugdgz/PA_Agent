@@ -299,6 +299,172 @@ def test_report_is_data_driven() -> None:
     print("  [OK] 报告随数据变化：涨/跌两批数据状态文本不同，区间边界各自独立")
 
 
+def test_ma_full() -> None:
+    """MA 算法：窗口均值、预热 nan、样本不足全 nan。"""
+    import math
+
+    from pa_agent.indicators.ma import ma_full
+
+    v = [float(i) for i in range(1, 11)]
+    r5 = ma_full(v, 5)
+    assert all(math.isnan(x) for x in r5[:4]), "MA5 前 4 位应 nan"
+    assert abs(r5[4] - 3.0) < 1e-9, f"MA5[4] 应=3.0，实得 {r5[4]}"
+    assert abs(r5[9] - 8.0) < 1e-9, f"MA5[9] 应=8.0，实得 {r5[9]}"
+
+    r10 = ma_full(v, 10)
+    assert all(math.isnan(x) for x in r10[:9]), "MA10 前 9 位应 nan"
+    assert abs(r10[9] - 5.5) < 1e-9, f"MA10[9] 应=5.5，实得 {r10[9]}"
+
+    assert all(math.isnan(x) for x in ma_full([1.0], 5)), "样本不足应全 nan"
+    print("  [OK] MA 算法：窗口均值正确、预热 nan、样本不足全 nan")
+
+
+def test_memory_ma_warmup_sufficient() -> None:
+    """预热常量必须 >= max(MA_PERIODS)，否则 MA60 全是 nan。"""
+    from pa_agent.data.snapshot import INDICATOR_WARMUP_BARS, MA_PERIODS
+
+    assert INDICATOR_WARMUP_BARS >= max(MA_PERIODS), (
+        f"INDICATOR_WARMUP_BARS={INDICATOR_WARMUP_BARS} < max(MA_PERIODS)={max(MA_PERIODS)}，"
+        "长周期均线将全部为 nan"
+    )
+    print(f"  [OK] 均线预热充足：WARMUP={INDICATOR_WARMUP_BARS} >= max(MA)={max(MA_PERIODS)}")
+
+
+def test_memory_flat_not_counted() -> None:
+    """走出幅度不足 0.5 ATR 时判flat，且**不计入**命中率。
+
+    这是记忆库最关键的诚实性保证：把"没方向"硬算成对或错会污染
+    命中率，让后续校准基于错误信号。
+    """
+    import json
+    import time
+
+    from pa_agent.memory.settle import _settle_impl
+    from pa_agent.memory.symbol_memory import load_profile, symbol_dir
+
+    _BASE_MS = 1_700_000_000_000
+    sym = "TESTFLAT"
+    d = symbol_dir(sym, "M15")
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        (d / "sessions.jsonl").write_text(
+            json.dumps({
+                # ts_ms 用**当前墙钟**（陈旧性检查靠它），bars_ts_ms 用 K 线时间
+                "session_id": "s1", "ts_ms": int(time.time() * 1000),
+                "bars_ts_ms": _BASE_MS,
+                "symbol": sym, "timeframe": "M15",
+                "close": 1.1000, "atr": 0.0010,
+                "direction": "bullish", "direction_conf": 0.4,
+                "plans": {}, "settled": False,
+            }, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+        class _B:
+            def __init__(self, ts, h, l):
+                self.ts_open, self.high, self.low = ts, h, l
+                self.close = (h + l) / 2
+
+        # 后续 10 根，振幅仅 ±0.3 ATR → 应判 flat
+        bars = [_B(1_700_000_000_000 + i * 900_000, 1.1003, 1.0997) for i in range(1, 11)]
+        out = _settle_impl(sym, "M15", bars, 0.0010)
+        assert out, "应产生一条结算记录"
+        assert out[0].actual == "flat", f"应判flat，实得 {out[0].actual}"
+        assert out[0].direction_hit is None, "flat 时命中必须是 None，不能算对或错"
+        assert out[0].status == "ok", f"状态应为 ok，实得 {out[0].status}"
+
+        prof = load_profile(sym, "M15")
+        assert prof.direction_accuracy is None, "flat 不应计入命中率（应为 None）"
+        print("  [OK] 结算诚实性：振幅不足判 flat 且不计入命中率")
+    finally:
+        import shutil
+
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_memory_settle_uses_bar_time() -> None:
+    """结算必须用K 线时间（bars_ts_ms），不能用电墙壁钟 ts_ms。
+
+    否则 MT5 服务器时间与本机墙钟差 3 小时时会误判"无后续 K 线"。
+    """
+    import json
+    import time
+
+    from pa_agent.memory.settle import _settle_impl
+    from pa_agent.memory.symbol_memory import symbol_dir
+
+    _BASE_MS = 1_700_000_000_000
+    sym = "TESTBARTIME"
+    d = symbol_dir(sym, "M15")
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        (d / "sessions.jsonl").write_text(
+            json.dumps({
+                "session_id": "s2",
+                # 墙钟与 K 线时间差 999 根（模拟时区错位），
+                # 但仍用当前墙钟避免被判 stale
+                "ts_ms": int(time.time() * 1000),
+                "bars_ts_ms": _BASE_MS,
+                "symbol": sym, "timeframe": "M15",
+                "close": 1.1000, "atr": 0.0010,
+                "direction": "bullish", "direction_conf": 0.5,
+                "plans": {}, "settled": False,
+            }, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+        class _B:
+            def __init__(self, ts, h, l):
+                self.ts_open, self.high, self.low = ts, h, l
+                self.close = (h + l) / 2
+
+        # K 线时间在 bars_ts_ms 之后 → 应能找到后续 K 线
+        bars = [_B(_BASE_MS + i * 900_000, 1.1015, 1.0995) for i in range(1, 11)]
+        out = _settle_impl(sym, "M15", bars, 0.0010)
+        assert out, "应产生结算记录"
+        assert out[0].status == "ok", (
+            f"用 K 线时间应能结算，实得 status={out[0].status}（若为 no_bars 说明错用了墙钟）"
+        )
+        assert out[0].actual == "bullish", f"应判bullish，实得 {out[0].actual}"
+        assert out[0].direction_hit is True, "预测 bullish 且实际 bullish → 应命中"
+        print("  [OK] 结算用 K 线时间：墙钟偏移不影响结算（预测 bullish → 实际 bullish 命中）")
+    finally:
+        import shutil
+
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_memory_symbol_isolation() -> None:
+    """品种隔离：不同品种/周期互不干扰。"""
+    from pa_agent.memory.symbol_memory import _safe_dirname, symbol_dir
+
+    assert _safe_dirname("USD/CNH") == "USD_CNH", "斜杠应被替换"
+    assert _safe_dirname("  ") == "UNKNOWN", "空名应回落"
+    assert _safe_dirname("") == "UNKNOWN", "空串应回落"
+    # 回归：曾用 strip("._") 把 "_DBG" 变成 "DBG"，导致写入与读取路径错位
+    assert _safe_dirname("_DBG") == "_DBG", (
+        f"前导下划线必须保留，否则读写路径不一致：实得 {_safe_dirname('_DBG')}"
+    )
+    # 同一函数进出必然同名（不做任何 strip 的直接体现）
+    for name in ("EURUSD", "USD/CNH", "_X", "M15"):
+        assert _safe_dirname(name) == _safe_dirname(name), "净化必须幂等"
+    # 目录隔离：品种和周期都参与路径
+    assert symbol_dir("EURUSD", "M15") != symbol_dir("EURUSD", "M1"), (
+        "同品种不同周期必须是不同目录"
+    )
+    assert symbol_dir("EURUSD", "M15") != symbol_dir("GBPUSD", "M15"), (
+        "不同品种必须是不同目录"
+    )
+    assert symbol_dir("USD/CNH", "M15").parent.name == "USD_CNH", "斜杠品种应被净化成合法目录名"
+    assert symbol_dir("EURUSD", "M15") != symbol_dir("EURUSD", "M1"), (
+        "同品种不同周期必须是不同目录"
+    )
+    assert symbol_dir("EURUSD", "M15") != symbol_dir("GBPUSD", "M15"), (
+        "不同品种必须是不同目录"
+    )
+    print("  [OK] 品种隔离：目录名净化 + 品种/周期各自独立")
+
+
 def test_branch_derivation() -> None:
     """三分支推导：恰好 3 个、多空概率可区分、虚高 RR 被惩罚。
 
@@ -393,6 +559,11 @@ def main() -> None:
     test_calibration_path_is_next_to_weights()
     test_report_is_data_driven()
     test_branch_derivation()
+    test_ma_full()
+    test_memory_ma_warmup_sufficient()
+    test_memory_symbol_isolation()
+    test_memory_flat_not_counted()
+    test_memory_settle_uses_bar_time()
     print("全部通过 ✅")
 
 
