@@ -262,6 +262,9 @@ def generate_report(frame: Any, settings: Any, progress: Any = None) -> LayaRepo
     _journal_report(report=report, frame=frame, cfg=cfg,
                     device=engine.device, latency_ms=latency_ms,
                     n_errors=len(errors))
+    # ── 品种记忆库：先结算上一条预测，再归档本次（失败静默，绝不影响报告）
+    _update_symbol_memory(report=report, frame=frame, atr=atr)
+
     # ── 最近一次报告落盘（供 MT5 面板「导入分析」读取；失败静默）
     _persist_latest(report)
     if progress is not None:
@@ -270,6 +273,36 @@ def generate_report(frame: Any, settings: Any, progress: Any = None) -> LayaRepo
         except Exception:  # noqa: BLE001
             pass
     return report
+
+
+def _update_symbol_memory(*, report: LayaReport, frame: Any, atr: float | None) -> None:
+    """结算上一条预测 + 归档本次分析到该品种的记忆库。
+
+    顺序很关键：先用当前 bars 结算**上一次**的预测（此时后续K 线已走出），
+    再把本次存进去。若先存后结，本次永远不会被结算。
+
+    任何异常都吞掉——记忆库是纯外围，主流程绝不因它失败。
+    """
+    try:
+        from pa_agent.memory.symbol_memory import save_session
+        from pa_agent.memory.settle import rebuild_profile, settle_pending
+
+        sym, tf = report.symbol, report.timeframe
+        if not sym or not tf:
+            return
+
+        # 1) 结算上一条（bars 需 newest-first，正是 frame.bars 的顺序）
+        settle_pending(symbol=sym, timeframe=tf, bars=list(frame.bars), atr=atr)
+
+        # 2) 归档本次
+        sid = save_session(symbol=sym, timeframe=tf, report=report, frame=frame)
+        if sid is None:
+            return
+
+        # 3) 重算画像（命中率/均线分布/常见支撑阻力）
+        rebuild_profile(sym, tf)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("品种记忆库更新失败（不影响报告）: %s", exc)
 
 
 def _persist_latest(report: LayaReport) -> None:

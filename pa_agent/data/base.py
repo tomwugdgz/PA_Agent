@@ -58,8 +58,29 @@ def normalize_kline_bar(bar: KlineBar) -> KlineBar:
 @dataclass(frozen=True)
 class IndicatorBundle:
     """Per-bar indicator values aligned to a KlineFrame's bars list."""
+
     ema20: tuple[float, ...]   # len == len(bars); nan for warm-up period
     atr14: tuple[float, ...]   # len == len(bars); nan for warm-up period
+
+    #: 简单移动平均。键为周期（5/10/20/60），值为与 bars 对齐的序列，
+    #: 预热期为nan。默认为空 dict——旧调用方只传 ema20/atr14 仍可构造，
+    #: 取用方必须用 ``bundle.mas.get(20)`` 而非 ``bundle.mas[20]``。
+    mas: dict[int, tuple[float, ...]] = field(default_factory=dict)
+
+    def ma(self, period: int, index: int = 0) -> float | None:
+        """取第 *index* 根K 线的 MA(*period*)，无效/缺失返回 None。
+
+        ``index`` 语义与 ``bars`` 一致（0 = 最新一根）。
+        返回 None 而非 nan，是为了避免调用方忘记判nan 导致污染计算。
+        """
+        series = self.mas.get(period)
+        if not series or index >= len(series):
+            return None
+        try:
+            v = float(series[index])
+        except (TypeError, ValueError):
+            return None
+        return None if math.isnan(v) else v
 
 
 # ── KlineFrame ────────────────────────────────────────────────────────────────
