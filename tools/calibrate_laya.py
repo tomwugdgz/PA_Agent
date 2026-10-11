@@ -43,7 +43,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -69,19 +68,27 @@ MIN_SAMPLES = 120
 OFFICIAL_MIN_BUCKET_N = 2000
 
 
-def _normalize_identity_field(cal_path: Path) -> bool:
-    """把校准文件里的 ``model_id_or_path`` 归一化成 agent 实际持有的形态。
+def _normalize_identity_field(cal_path: Path, model_dir: str) -> bool:
+    """把校准文件里的 ``model_id_or_path`` 对齐到 **agent 实际持有的字符串**。
 
     上游 ``laya.calibrate._warn_if_identity_mismatch`` 用**字符串相等**判断
-    校准是否匹配当前模型。而 ``settings.json`` 里``model_dir`` 惯用正斜杠
-    （``C:/Users/...``），agent 内部保存的却是反斜杠（``C:\\Users\\...``），
-    于是每次加载都会刷一条误报警告::
+    校准是否匹配当前模型，而 ``laya/agent.py`` 里是::
 
-        UserWarning: calibration was fitted for model_id_or_path='C:/...'
-        but this agent is model_id_or_path='C:\\...'. Loading anyway.
+        self.model_id_or_path = model_id_or_path   # 原样保存，不做规范化
 
-    温度**确实照常加载**（上游只是warn 后继续），所以这是纯噪音问题。
+    所以 agent 持有的是**调用方传入的原始字符串**——即 ``settings.json`` 里的
+    ``laya.model_dir``（本项目惯用正斜杠 ``C:/Users/...``）。
+    只要校准文件里存成别的形态（早期版本用 ``os.path.normpath`` 写成了
+    ``C:\\Users\\...``），每次加载都会刷一条误报警告::
+
+        UserWarning: calibration was fitted for model_id_or_path='C:\\...'
+        but this agent is model_id_or_path='C:/...'. Loading anyway.
+
+    温度**确实照常加载**（上游只是 warn 后继续），所以这是纯噪音问题。
     这里只改写记录字段，不动任何温度数值。
+
+    注意方向：**以 agent 的值为准**，而不是反过来规范化成系统分隔符——
+    否则改了文件却和真正参与比对的字符串不一致，问题依旧。
     """
     try:
         payload = json.loads(cal_path.read_text(encoding="utf-8"))
@@ -90,15 +97,27 @@ def _normalize_identity_field(cal_path: Path) -> bool:
     recorded = payload.get("model_id_or_path")
     if not isinstance(recorded, str) or not recorded:
         return False
-    # os.path.normpath 会把正斜杠统一成本机原生分隔符（Windows 下为反斜杠）
-    normalized = os.path.normpath(recorded)
-    if normalized == recorded:
+    if recorded == model_dir:
         return False
-    payload["model_id_or_path"] = normalized
+    payload["model_id_or_path"] = model_dir
     cal_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     return True
+
+
+def repair_calibration_identity(model_dir: str) -> bool:
+    """已生成的校准文件若与当前 ``model_dir`` 字符串不一致，就地修正。
+
+    供修复历史文件用（与 ``run_calibration`` 落盘时调用的同一逻辑）。
+    """
+    try:
+        from pa_agent.ai.laya_annotation import calibration_out_path
+
+        return _normalize_identity_field(calibration_out_path(model_dir), model_dir)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ⚠️ 校准身份字段修正失败（不影响温度生效）：{exc}")
+        return False
 
 
 def _collect_records(agent: Any, pairs: list) -> list:
@@ -288,7 +307,7 @@ def run_calibration(
     # ── 落盘 ────────────────────────────────────────────────────────────
     out_path.parent.mkdir(parents=True, exist_ok=True)
     agent.save_calibration(str(out_path))
-    _normalize_identity_field(out_path)
+    _normalize_identity_field(out_path, cfg.laya.model_dir)
     print(f"\n✅ 校准已保存：{out_path}")
     print("   下次加载 Laya 时自动生效（engine 会读同一路径），无需改配置。")
 
@@ -316,6 +335,12 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("--status", action="store_true", help="只看状态，不加载模型")
+    ap.add_argument(
+        "--repair-identity",
+        action="store_true",
+        help="只把校准文件的 model_id_or_path 对齐到当前 settings（消除上游 UserWarning），"
+             "不加载模型、不改温度",
+    )
     ap.add_argument("--force", action="store_true", help="覆盖已存在的校准文件")
     ap.add_argument("--max-pairs", type=int, default=0, help="只用最近 N 条（0=全部）")
     ap.add_argument("--min-answer-confidence", type=float, default=0.0,
@@ -324,6 +349,16 @@ def main() -> None:
 
     if args.status:
         sys.exit(show_status())
+
+    if args.repair_identity:
+        cfg = load_config()
+        model_dir = cfg.laya.model_dir
+        print(f"当前 settings 的 model_dir : {model_dir!r}")
+        if repair_calibration_identity(model_dir):
+            print("✅ 已对齐（只改了身份字段，温度未动）")
+        else:
+            print("✅ 已一致，无需修改")
+        sys.exit(0)
     sys.exit(run_calibration(
         min_confidence=args.min_answer_confidence,
         max_pairs=args.max_pairs,

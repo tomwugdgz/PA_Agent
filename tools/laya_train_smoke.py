@@ -299,6 +299,74 @@ def test_report_is_data_driven() -> None:
     print("  [OK] 报告随数据变化：涨/跌两批数据状态文本不同，区间边界各自独立")
 
 
+def test_calibration_identity_matches_agent() -> None:
+    """校准文件的 ``model_id_or_path`` 必须与 agent 实际持有值**完全一致**。
+
+    背景（踩过两次坑）
+    ------------------
+    上游 ``laya.calibrate._warn_if_identity_mismatch`` 用字符串相等判断，
+    而 ``laya/agent.py`` 是 ``self.model_id_or_path = model_id_or_path``
+    —— 原样保存调用方传入的字符串。GUI 走 ``load_settings()``，
+    拿到的是 settings.json 里的原样字符串（本项目是正斜杠）。
+
+    第一次错在把文件规范化成系统分隔符（反斜杠），与 agent 值不符；
+    第二次才知道**必须以 agent 的实际值为准**。
+
+    本测试锁定方向：以 ``load_settings().laya.model_dir`` 为基准。
+    """
+    import json
+
+    from pa_agent.ai.laya_annotation import calibration_out_path
+    from pa_agent.config.settings import load_settings
+
+    model_dir = load_settings().laya.model_dir
+    p = calibration_out_path(model_dir)
+    if not p.is_file():
+        print("  [SKIP] 校准文件不存在，本项跳过")
+        return
+
+    payload = json.loads(p.read_text(encoding="utf-8"))
+    recorded = payload.get("model_id_or_path")
+    assert recorded == model_dir, (
+        f"校准身份字段与 agent 实际值不符：\n"
+        f"  文件记录 = {recorded!r}\n"
+        f"  agent 实值 = {model_dir!r}\n"
+        f"  → 会触发上游 UserWarning 噪音。修复：\n"
+        f"    python tools/calibrate_laya.py --repair-identity"
+    )
+    print(f"  [OK] 校准身份字段与 agent 实值一致：{recorded!r}")
+
+
+def test_calibration_repair_identity() -> None:
+    """修复函数必须只改身份字段，不动温度。"""
+    import json
+    import tempfile
+    from pathlib import Path
+
+    from tools.calibrate_laya import _normalize_identity_field
+
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "calibration.json"
+        payload = {
+            "version": 2,
+            "temperature": [1.9436, 1.0, 5.0],
+            "model_id_or_path": "C:\\wrong\\path",
+            "subfolder": "multilingual",
+        }
+        p.write_text(json.dumps(payload), encoding="utf-8")
+
+        # 对齐到目标值
+        assert _normalize_identity_field(p, "C:/right/path") is True
+        got = json.loads(p.read_text(encoding="utf-8"))
+        assert got["model_id_or_path"] == "C:/right/path", "必须写成 agent 实际值"
+        assert got["temperature"] == [1.9436, 1.0, 5.0], "温度绝不能被改动"
+        assert got["version"] == 2 and got["subfolder"] == "multilingual", "其他字段保留"
+
+        # 已一致时应返回 False（不产生无谓写盘）
+        assert _normalize_identity_field(p, "C:/right/path") is False
+    print("  [OK] 校准身份修复：只改身份字段，温度与其他字段不动，幂等")
+
+
 def test_external_launcher_resolution() -> None:
     """外部启动器：目标解析 + 精确定位 + 重复启动保护。
 
@@ -619,6 +687,8 @@ def main() -> None:
     test_memory_flat_not_counted()
     test_memory_settle_uses_bar_time()
     test_external_launcher_resolution()
+    test_calibration_repair_identity()
+    test_calibration_identity_matches_agent()
     print("全部通过 ✅")
 
 
