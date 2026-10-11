@@ -299,6 +299,60 @@ def test_report_is_data_driven() -> None:
     print("  [OK] 报告随数据变化：涨/跌两批数据状态文本不同，区间边界各自独立")
 
 
+def test_external_launcher_resolution() -> None:
+    """外部启动器：目标解析 + 精确定位 + 重复启动保护。
+
+    防三类回归：
+      1. tasklist 的 **GBK 编码陷阱**——简体中文 Windows 输出非 UTF-8，
+         早先用 text=True 会解码失败被吞掉，返回 None，保护静默失效。
+      2. 按进程名查——目标进程名就是 python.exe（跑 main.py），
+         本机常驻多个 python，按名字查必然误报"已在运行"，按钮永远点不动。
+      3. wmic——Win11 已移除，实测 WinError 2。
+    """
+    import subprocess
+    import time
+
+    from pa_agent.gui.external_launcher import (
+        build_command,
+        find_ta_process,
+        is_running,
+        resolve_target,
+    )
+
+    target = resolve_target()
+    assert target.exists, f"目标不齐备：{target.missing}"
+    cmd = build_command(target)
+    assert cmd[0] == str(target.python_exe), "命令首项必须是 venv 解释器"
+    assert cmd[1] == str(target.script), "命令次项必须是 main.py"
+    assert target.script.name == "main.py", (
+        "入口必须是 main.py——exe 是 Typer CLI，无参运行只打印帮助后退出"
+    )
+
+    # ① 一定不存在的进程名 → 必须 None 且不抛异常
+    assert is_running("definitely_not_a_real_process_xyz.exe") is None
+
+    # ② 精确定位：启动一个命令行含 main.py 的进程，必须能被定位到
+    proc = subprocess.Popen(
+        [str(target.python_exe), "-c", "import time;time.sleep(8)", "main.py"],
+        cwd=str(target.workdir),
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    try:
+        time.sleep(2.0)
+        assert find_ta_process() is not None, (
+            "运行中的 TradingAgents 必须能被定位到（命令行过滤失效）"
+        )
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=6)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    time.sleep(1.0)
+    assert find_ta_process() is None, "进程终止后必须不再被定位"
+    print("  [OK] 外部启动器：main.py 入口 +命令行精确定位 + 查重保护")
+
+
 def test_ma_full() -> None:
     """MA 算法：窗口均值、预热 nan、样本不足全 nan。"""
     import math
@@ -564,6 +618,7 @@ def main() -> None:
     test_memory_symbol_isolation()
     test_memory_flat_not_counted()
     test_memory_settle_uses_bar_time()
+    test_external_launcher_resolution()
     print("全部通过 ✅")
 
 

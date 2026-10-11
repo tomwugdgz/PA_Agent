@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 from typing import Any
 
 from PyQt6.QtCore import QThread, QTimer, pyqtSignal, QObject
@@ -646,6 +647,21 @@ class MainWindow(QMainWindow):
         )
         self._laya_btn.clicked.connect(self._on_laya_report)
         ctrl_layout.addWidget(self._laya_btn)
+
+        # 外部 TradingAgents：独立项目，用后台进程启动，不阻塞本窗口
+        self._ta_btn = QPushButton("TradingAgents")
+        self._ta_btn.setToolTip(
+            "后台启动外部 TradingAgents 项目（多智能体交易分析）。\n"
+            "与本程序完全独立，各自跑各自的模型与数据。\n"
+            "若它已在运行，会提示现有进程而不会重复启动。"
+        )
+        self._ta_btn.clicked.connect(self._on_launch_tradingagents)
+        ctrl_layout.addWidget(self._ta_btn)
+        #: 持有 subprocess.Popen 引用；不持有可能被 GC 回收。
+        #: 类型用 Any ——它实际是 subprocess.Popen，不是 QProcess。
+        self._ta_process: Any = None
+        #: 日志文件句柄，退出时需关闭
+        self._ta_log_fh: Any = None
 
         # MT5 交易面板：自动下单（需确认）+ 确定性回测 + 生成 MQL5 EA
         self._mt5_btn = QPushButton("MT5 交易")
@@ -1760,6 +1776,172 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001
             logger.warning("Laya report dialog failed: %s", exc)
             QMessageBox.critical(self, "Laya 报告", f"打开报告失败：{exc}")
+
+    def _on_launch_tradingagents(self) -> None:
+        """「TradingAgents」按钮：后台启动外部 TradingAgents 的分析流程。
+
+        实测结论：该项目的 exe 是 Typer CLI，无参数运行只会打印帮助后退出；
+        真正会干活的是 ``main.py``（会调 LLM API，跑完退出，不是常驻服务）。
+        所以这里跑 ``.venv\\Scripts\\python.exe main.py``，输出写入日志文件。
+        """
+        from pa_agent.gui.external_launcher import (
+            build_command,
+            find_ta_process,
+            resolve_target,
+        )
+
+        if getattr(self, "_demo_mode", False):
+            QMessageBox.information(self, "TradingAgents", "演示模式下不可用。")
+            return
+
+        # ① 精确定位是否已在运行（按命令行，不能只看 python.exe——
+        #    本机常驻多个 python，按名字查会永远误报"已在运行"）
+        pid = find_ta_process()
+        if pid is not None:
+            QMessageBox.information(
+                self, "TradingAgents",
+                f"TradingAgents 已在运行（PID {pid}），不重复启动。\n\n"
+                "如需重启，请先关闭它再点此按钮。",
+            )
+            return
+
+        # ② 解析目标
+        target = resolve_target()
+        if not target.exists:
+            QMessageBox.critical(
+                self, "TradingAgents",
+                f"{target.missing}\n\n"
+                "请确认 TradingAgents 已安装，或修改 "
+                "pa_agent/gui/external_launcher.py 里的 TRADINGAGENTS_DIR。",
+            )
+            return
+
+        # ③ 日志文件：把它的输出留下来，GUI 静默模式下也能事后排查
+        try:
+            from pa_agent.config.paths import PROJECT_ROOT
+
+            log_dir = PROJECT_ROOT / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = log_dir / "tradingagents.log"
+            log_fh = log_path.open("a", encoding="utf-8")
+            log_fh.write(
+                f"\n===== 启动 {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n"
+                f"命令: {' '.join(build_command(target))}\n"
+            )
+            log_fh.flush()
+        except OSError as exc:
+            log_path = None
+            log_fh = None
+            logger.warning("打开 TradingAgents 日志失败（仍会启动）: %s", exc)
+
+        # ④ 启动。
+        #
+        # 为什么用 subprocess.Popen 而不是 QProcess
+        # ------------------------------------------
+        # 实测在本机QProcess 启动同一条命令直接失败::
+        #     QProcess.errorOccurred → FailedToStart
+        #     errorString() = "pipe: 系统找不到指定的文件"
+        # 而**完全相同的命令**用 subprocess.Popen 启动成功并持续运行。
+        # 路径只有 79 字符，不是长度问题；是 QProcess 在当前
+        # Python+PyQt6 组合下无法创建管道。该失败静默（无黑窗、无提示），
+        # 用户只会看到"点了没反应"，所以必须换成可靠方案。
+        #
+        # 输出直接重定向到日志文件，无需手动管理文件句柄。
+        import subprocess
+
+        try:
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            self._ta_process = subprocess.Popen(  # type: ignore[assignment]
+                build_command(target),
+                cwd=str(target.workdir),
+                stdout=log_fh if log_fh is not None else subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
+                creationflags=flags,
+            )
+        except OSError as exc:
+            self._ta_process = None
+            if log_fh is not None:
+                try:
+                    log_fh.close()
+                except OSError:
+                    pass
+                self._ta_log_fh = None
+            logger.warning("TradingAgents 启动失败：%s", exc)
+            QMessageBox.critical(self, "TradingAgents", f"启动失败：{exc}")
+            return
+
+        pid = self._ta_process.pid
+        logger.info("TradingAgents 已启动 PID=%s", pid)
+        hint = "（输出见 logs/tradingagents.log）" if log_path else ""
+        self.statusBar().showMessage(f"TradingAgents 已在后台启动 · PID {pid}{hint}", 8000)
+        # 启动期间置灰，防止连点点出多份
+        self._ta_btn.setEnabled(False)
+        # 启动后复查：确认进程真的活下来了（3s，覆盖 PowerShell 查询耗时）
+        QTimer.singleShot(3000, self._restore_ta_button_if_not_running)
+
+    def _restore_ta_button_if_not_running(self) -> None:
+        """启动 3 秒后复查：进程已退出就把按钮恢复可点。"""
+        import subprocess
+
+        from pa_agent.gui.external_launcher import find_ta_process
+
+        proc = self._ta_process
+        if proc is None:
+            self._ta_btn.setEnabled(True)
+            return
+        try:
+            rc = proc.poll()
+        except OSError:
+            rc = None
+        if rc is not None:
+            # 已退出（不论正常还是异常），恢复按钮并清理日志句柄
+            self._ta_btn.setEnabled(True)
+            self._ta_process = None
+            fh = getattr(self, "_ta_log_fh", None)
+            if fh is not None:
+                try:
+                    fh.write(
+                        f"\n===== 结束 rc={rc} "
+                        f"{time.strftime('%Y-%m-%d %H:%M:%S')} =====\n"
+                    )
+                    fh.close()
+                except OSError:
+                    pass
+                self._ta_log_fh = None
+            if rc != 0:
+                tail = ""
+                try:
+                    from pa_agent.config.paths import PROJECT_ROOT
+
+                    lp = PROJECT_ROOT / "logs" / "tradingagents.log"
+                    if lp.is_file():
+                        tail = lp.read_text(
+                            encoding="utf-8", errors="replace"
+                        )[-500:]
+                except OSError:
+                    tail = ""
+                self.statusBar().showMessage(
+                    f"TradingAgents 已结束（返回码 {rc}）", 8000
+                )
+                QMessageBox.warning(
+                    self, "TradingAgents",
+                    f"TradingAgents 已退出，返回码 {rc}。\n\n"
+                    + (f"日志尾部：\n{tail}" if tail else
+                       "若启动失败，通常是 API Key 未配置或网络问题。"),
+                )
+            else:
+                self.statusBar().showMessage(
+                    "TradingAgents 已正常结束", 8000
+                )
+            return
+
+        # 仍在运行：按钮保持置灰，并确认外部查询也能定位到
+        try:
+            found = find_ta_process()
+            if found is None:
+                logger.debug("TA 外部查询未定位到（进程可能刚启动，命令行尚未可见）")
+        except Exception:  # noqa: BLE001
+            logger.debug("TA 外部查询异常", exc_info=True)
 
     def _on_mt5_panel(self) -> None:
         """「MT5 交易」按钮：下单 / 回测 / 生成 MQL5 四合一面板。"""
@@ -4377,6 +4559,16 @@ class MainWindow(QMainWindow):
             self._stop_refresh_loop()
         except RuntimeError as exc:
             logger.debug("Shutdown cleanup skipped: %s", exc)
+        # 外部 TradingAgents 是独立进程，**不随本窗口关闭而杀**（用户可能还想用）。
+        # 这里只关掉日志句柄并清引用。
+        fh = getattr(self, "_ta_log_fh", None)
+        if fh is not None:
+            try:
+                fh.close()
+            except OSError:
+                pass
+            self._ta_log_fh = None
+        self._ta_process = None
         super().closeEvent(event)
 
     def showEvent(self, event: QShowEvent | None) -> None:
